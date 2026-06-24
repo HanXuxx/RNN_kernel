@@ -1,0 +1,7 @@
+-r requirements.txt
+
+matplotlib==3.11.0
+ninja==1.13.0
+pandas==3.0.3
+pytest==9.1.1
+

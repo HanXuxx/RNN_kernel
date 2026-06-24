@@ -7,6 +7,8 @@ A100/H200 GPU，以及 `rnn_benchmark.py` 所代表的基准测试形状。
 
 ## 阶段 0：建立基线
 
+当前 A100 第一轮结果已记录在 `docs/a100_baseline_study.md`。
+
 1. 在 A100 和 H200 上运行当前基准测试，重点覆盖疑似性能断崖附近的 hidden
    size：`96,112,120,128,129,130,144,160,192,256`。
 2. 记录 GPU 型号、驱动、PyTorch 版本、CUDA 运行时、cuDNN 版本、批大小、
@@ -22,8 +24,10 @@ A100/H200 GPU，以及 `rnn_benchmark.py` 所代表的基准测试形状。
 ## 阶段 1：低风险 PyTorch 层优化
 
 1. 确认输入、权重和 hidden state 保持 contiguous，并且仍走 cuDNN 路径。
-2. 测试 `torch.backends.cudnn.benchmark`、deterministic 开关、TF32 设置，以及
-   A100/H200 上的 bf16/amp。
+2. deterministic、cuDNN benchmark、禁用 cuDNN、torch.compile、完整 BPTT
+   sequence chunking 和 batch/sequence shape 变化已在
+   `docs/a100_fp32_method_study.md` 中完成第一轮验证；这些方法没有在保持原始
+   单段 `seq_len=8000` 语义且不降精度的前提下消除断崖。
 3. 只有在隔离 RNN kernel 时间后，再测量融合优化器替代方案。
 4. 测试 hidden size 对齐策略，例如填充到更利于 tensor core 的倍数，再在 head
    输出处切片；前提是数值语义可接受。

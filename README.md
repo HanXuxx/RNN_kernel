@@ -69,3 +69,6 @@ python rnn_benchmark.py \
 
 修改代码前先阅读 `docs/codex_development.md`，选择下一步优化任务前先阅读
 `docs/optimization_plan.md`。
+
+当前 A100 第一轮闭环研究结论见 `docs/a100_baseline_study.md`。
+不降精度的 fp32-only 方法研究见 `docs/a100_fp32_method_study.md`。

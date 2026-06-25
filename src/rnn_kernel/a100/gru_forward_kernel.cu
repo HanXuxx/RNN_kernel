@@ -854,6 +854,651 @@ void a100_gru_forward_from_gates_cooperative_h256_shmem_kernel(
 }
 
 extern "C" __global__
+void a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache_kernel(
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ partial_gates,
+    float* __restrict__ hidden_state,
+    float* __restrict__ output,
+    float* __restrict__ gate_cache,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int CTAS_PER_BATCH = 4;
+    constexpr int K_TILE = HIDDEN_SIZE / CTAS_PER_BATCH;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+
+    extern __shared__ float shared[];
+    float* partial0_local = shared;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 2;
+    const int cta_idx = global_cta & (CTAS_PER_BATCH - 1);
+    const int tid = threadIdx.x;
+    const int warp_lane = tid & (WARP_SIZE - 1);
+    const int lane = tid & 15;
+    const int group_idx = tid / 16;
+    const int groups_per_block = blockDim.x / 16;
+    const unsigned int group_mask = 0xffffu << (warp_lane & 16);
+
+    float* hidden = hidden_state + batch_idx * HIDDEN_SIZE;
+    float* partial_base = partial_gates + global_cta * 3 * HIDDEN_SIZE;
+
+    if (cta_idx == 0) {
+        for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+            hidden[hid] = h0[batch_idx * HIDDEN_SIZE + hid];
+        }
+    }
+    grid.sync();
+
+    const int k_begin = cta_idx * K_TILE;
+
+    for (int step = 0; step < seq_len; ++step) {
+        const float* input_step = input_gates + (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE;
+        float* output_step = output + (batch_idx * seq_len + step) * HIDDEN_SIZE;
+        float* cache_step = gate_cache + (batch_idx * seq_len + step) * CACHE_SIZE;
+
+        // 在 forward 的已有计算路径上顺手保存 backward pointwise 所需值。
+        for (int hid = group_idx; hid < HIDDEN_SIZE; hid += groups_per_block) {
+            const float* weight_r = weight_hh + hid * HIDDEN_SIZE + k_begin;
+            const float* weight_z = weight_hh + (HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            const float* weight_n = weight_hh + (2 * HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            float acc_r = 0.0f;
+            float acc_z = 0.0f;
+            float acc_n = 0.0f;
+
+#pragma unroll
+            for (int k_local = lane; k_local < K_TILE; k_local += 16) {
+                const int k = k_begin + k_local;
+                const float hidden_value = hidden[k];
+                acc_r += hidden_value * weight_r[k_local];
+                acc_z += hidden_value * weight_z[k_local];
+                acc_n += hidden_value * weight_n[k_local];
+            }
+
+            acc_r = half_warp_reduce_sum(acc_r, group_mask);
+            acc_z = half_warp_reduce_sum(acc_z, group_mask);
+            acc_n = half_warp_reduce_sum(acc_n, group_mask);
+
+            if (lane == 0) {
+                float* partial_out = (cta_idx == 0) ? partial0_local : partial_base;
+                partial_out[hid] = acc_r;
+                partial_out[HIDDEN_SIZE + hid] = acc_z;
+                partial_out[2 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+
+        if (cta_idx == 0) {
+            const float* partial1 = partial_gates
+                + (batch_idx * CTAS_PER_BATCH + 1) * 3 * HIDDEN_SIZE;
+            const float* partial2 = partial1 + 3 * HIDDEN_SIZE;
+            const float* partial3 = partial2 + 3 * HIDDEN_SIZE;
+
+            for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+                const float acc_r = bias_hh[hid]
+                    + partial0_local[hid]
+                    + partial1[hid]
+                    + partial2[hid]
+                    + partial3[hid];
+                const float acc_z = bias_hh[HIDDEN_SIZE + hid]
+                    + partial0_local[HIDDEN_SIZE + hid]
+                    + partial1[HIDDEN_SIZE + hid]
+                    + partial2[HIDDEN_SIZE + hid]
+                    + partial3[HIDDEN_SIZE + hid];
+                const float acc_n = bias_hh[2 * HIDDEN_SIZE + hid]
+                    + partial0_local[2 * HIDDEN_SIZE + hid]
+                    + partial1[2 * HIDDEN_SIZE + hid]
+                    + partial2[2 * HIDDEN_SIZE + hid]
+                    + partial3[2 * HIDDEN_SIZE + hid];
+
+                const float i_r = input_step[hid];
+                const float i_z = input_step[HIDDEN_SIZE + hid];
+                const float i_n = input_step[2 * HIDDEN_SIZE + hid];
+                const float reset_gate = 1.0f / (1.0f + expf(-(i_r + acc_r)));
+                const float update_gate = 1.0f / (1.0f + expf(-(i_z + acc_z)));
+                const float new_gate = tanhf(i_n + reset_gate * acc_n);
+                const float hidden_prev = hidden[hid];
+                const float hidden_next = new_gate + update_gate * (hidden_prev - new_gate);
+                hidden[hid] = hidden_next;
+                output_step[hid] = hidden_next;
+                cache_step[hid] = reset_gate;
+                cache_step[HIDDEN_SIZE + hid] = update_gate;
+                cache_step[2 * HIDDEN_SIZE + hid] = new_gate;
+                cache_step[3 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+    }
+}
+
+extern "C" __global__
+void a100_gru_forward_from_gates_cooperative_h256_shmem_grad_coeff_cache_kernel(
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ partial_gates,
+    float* __restrict__ hidden_state,
+    float* __restrict__ output,
+    float* __restrict__ grad_coeff_cache,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int CTAS_PER_BATCH = 4;
+    constexpr int K_TILE = HIDDEN_SIZE / CTAS_PER_BATCH;
+    constexpr int CACHE_SIZE = 5 * HIDDEN_SIZE;
+
+    extern __shared__ float shared[];
+    float* partial0_local = shared;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 2;
+    const int cta_idx = global_cta & (CTAS_PER_BATCH - 1);
+    const int tid = threadIdx.x;
+    const int warp_lane = tid & (WARP_SIZE - 1);
+    const int lane = tid & 15;
+    const int group_idx = tid / 16;
+    const int groups_per_block = blockDim.x / 16;
+    const unsigned int group_mask = 0xffffu << (warp_lane & 16);
+
+    float* hidden = hidden_state + batch_idx * HIDDEN_SIZE;
+    float* partial_base = partial_gates + global_cta * 3 * HIDDEN_SIZE;
+
+    if (cta_idx == 0) {
+        for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+            hidden[hid] = h0[batch_idx * HIDDEN_SIZE + hid];
+        }
+    }
+    grid.sync();
+
+    const int k_begin = cta_idx * K_TILE;
+
+    for (int step = 0; step < seq_len; ++step) {
+        const float* input_step = input_gates + (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE;
+        float* output_step = output + (batch_idx * seq_len + step) * HIDDEN_SIZE;
+        float* cache_step = grad_coeff_cache + (batch_idx * seq_len + step) * CACHE_SIZE;
+
+        for (int hid = group_idx; hid < HIDDEN_SIZE; hid += groups_per_block) {
+            const float* weight_r = weight_hh + hid * HIDDEN_SIZE + k_begin;
+            const float* weight_z = weight_hh + (HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            const float* weight_n = weight_hh + (2 * HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            float acc_r = 0.0f;
+            float acc_z = 0.0f;
+            float acc_n = 0.0f;
+
+#pragma unroll
+            for (int k_local = lane; k_local < K_TILE; k_local += 16) {
+                const int k = k_begin + k_local;
+                const float hidden_value = hidden[k];
+                acc_r += hidden_value * weight_r[k_local];
+                acc_z += hidden_value * weight_z[k_local];
+                acc_n += hidden_value * weight_n[k_local];
+            }
+
+            acc_r = half_warp_reduce_sum(acc_r, group_mask);
+            acc_z = half_warp_reduce_sum(acc_z, group_mask);
+            acc_n = half_warp_reduce_sum(acc_n, group_mask);
+
+            if (lane == 0) {
+                float* partial_out = (cta_idx == 0) ? partial0_local : partial_base;
+                partial_out[hid] = acc_r;
+                partial_out[HIDDEN_SIZE + hid] = acc_z;
+                partial_out[2 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+
+        if (cta_idx == 0) {
+            const float* partial1 = partial_gates
+                + (batch_idx * CTAS_PER_BATCH + 1) * 3 * HIDDEN_SIZE;
+            const float* partial2 = partial1 + 3 * HIDDEN_SIZE;
+            const float* partial3 = partial2 + 3 * HIDDEN_SIZE;
+
+            for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+                const float acc_r = bias_hh[hid]
+                    + partial0_local[hid]
+                    + partial1[hid]
+                    + partial2[hid]
+                    + partial3[hid];
+                const float acc_z = bias_hh[HIDDEN_SIZE + hid]
+                    + partial0_local[HIDDEN_SIZE + hid]
+                    + partial1[HIDDEN_SIZE + hid]
+                    + partial2[HIDDEN_SIZE + hid]
+                    + partial3[HIDDEN_SIZE + hid];
+                const float acc_n = bias_hh[2 * HIDDEN_SIZE + hid]
+                    + partial0_local[2 * HIDDEN_SIZE + hid]
+                    + partial1[2 * HIDDEN_SIZE + hid]
+                    + partial2[2 * HIDDEN_SIZE + hid]
+                    + partial3[2 * HIDDEN_SIZE + hid];
+
+                const float i_r = input_step[hid];
+                const float i_z = input_step[HIDDEN_SIZE + hid];
+                const float i_n = input_step[2 * HIDDEN_SIZE + hid];
+                const float reset_gate = 1.0f / (1.0f + expf(-(i_r + acc_r)));
+                const float update_gate = 1.0f / (1.0f + expf(-(i_z + acc_z)));
+                const float new_gate = tanhf(i_n + reset_gate * acc_n);
+                const float hidden_prev = hidden[hid];
+                const float hidden_next = new_gate + update_gate * (hidden_prev - new_gate);
+                hidden[hid] = hidden_next;
+                output_step[hid] = hidden_next;
+
+                // 多存 1H 导数系数，减少 backward split 中重复的 pointwise 乘法链。
+                const float one_minus_update = 1.0f - update_gate;
+                const float new_pre_coeff = one_minus_update * (1.0f - new_gate * new_gate);
+                cache_step[hid] = new_pre_coeff
+                    * acc_n
+                    * reset_gate
+                    * (1.0f - reset_gate);
+                cache_step[HIDDEN_SIZE + hid] = (hidden_prev - new_gate)
+                    * update_gate
+                    * (1.0f - update_gate);
+                cache_step[2 * HIDDEN_SIZE + hid] = new_pre_coeff;
+                cache_step[3 * HIDDEN_SIZE + hid] = new_pre_coeff * reset_gate;
+                cache_step[4 * HIDDEN_SIZE + hid] = update_gate;
+            }
+        }
+        grid.sync();
+    }
+}
+
+extern "C" __global__
+void a100_gru_forward_from_gates_cooperative_h256_parallel_update_gate_cache_kernel(
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ partial_gates,
+    float* __restrict__ hidden_state,
+    float* __restrict__ output,
+    float* __restrict__ gate_cache,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int CTAS_PER_BATCH = 4;
+    constexpr int K_TILE = HIDDEN_SIZE / CTAS_PER_BATCH;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 2;
+    const int cta_idx = global_cta & (CTAS_PER_BATCH - 1);
+    const int tid = threadIdx.x;
+    const int warp_lane = tid & (WARP_SIZE - 1);
+    const int lane = tid & 15;
+    const int group_idx = tid / 16;
+    const int groups_per_block = blockDim.x / 16;
+    const unsigned int group_mask = 0xffffu << (warp_lane & 16);
+
+    float* hidden = hidden_state + batch_idx * HIDDEN_SIZE;
+    float* partial_base = partial_gates + global_cta * 3 * HIDDEN_SIZE;
+
+    const int k_begin = cta_idx * K_TILE;
+    const int h_begin = cta_idx * K_TILE;
+    const int h_end = h_begin + K_TILE;
+
+    for (int hid = h_begin + tid; hid < h_end; hid += blockDim.x) {
+        hidden[hid] = h0[batch_idx * HIDDEN_SIZE + hid];
+    }
+    grid.sync();
+
+    for (int step = 0; step < seq_len; ++step) {
+        const float* input_step = input_gates + (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE;
+        float* output_step = output + (batch_idx * seq_len + step) * HIDDEN_SIZE;
+        float* cache_step = gate_cache + (batch_idx * seq_len + step) * CACHE_SIZE;
+
+        for (int hid = group_idx; hid < HIDDEN_SIZE; hid += groups_per_block) {
+            const float* weight_r = weight_hh + hid * HIDDEN_SIZE + k_begin;
+            const float* weight_z = weight_hh + (HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            const float* weight_n = weight_hh + (2 * HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            float acc_r = 0.0f;
+            float acc_z = 0.0f;
+            float acc_n = 0.0f;
+
+#pragma unroll
+            for (int k_local = lane; k_local < K_TILE; k_local += 16) {
+                const int k = k_begin + k_local;
+                const float hidden_value = hidden[k];
+                acc_r += hidden_value * weight_r[k_local];
+                acc_z += hidden_value * weight_z[k_local];
+                acc_n += hidden_value * weight_n[k_local];
+            }
+
+            acc_r = half_warp_reduce_sum(acc_r, group_mask);
+            acc_z = half_warp_reduce_sum(acc_z, group_mask);
+            acc_n = half_warp_reduce_sum(acc_n, group_mask);
+
+            if (lane == 0) {
+                partial_base[hid] = acc_r;
+                partial_base[HIDDEN_SIZE + hid] = acc_z;
+                partial_base[2 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+
+        for (int hid = h_begin + tid; hid < h_end; hid += blockDim.x) {
+            const float* partial0 = partial_gates
+                + (batch_idx * CTAS_PER_BATCH) * 3 * HIDDEN_SIZE;
+            const float* partial1 = partial0 + 3 * HIDDEN_SIZE;
+            const float* partial2 = partial1 + 3 * HIDDEN_SIZE;
+            const float* partial3 = partial2 + 3 * HIDDEN_SIZE;
+
+            const float acc_r = bias_hh[hid]
+                + partial0[hid]
+                + partial1[hid]
+                + partial2[hid]
+                + partial3[hid];
+            const float acc_z = bias_hh[HIDDEN_SIZE + hid]
+                + partial0[HIDDEN_SIZE + hid]
+                + partial1[HIDDEN_SIZE + hid]
+                + partial2[HIDDEN_SIZE + hid]
+                + partial3[HIDDEN_SIZE + hid];
+            const float acc_n = bias_hh[2 * HIDDEN_SIZE + hid]
+                + partial0[2 * HIDDEN_SIZE + hid]
+                + partial1[2 * HIDDEN_SIZE + hid]
+                + partial2[2 * HIDDEN_SIZE + hid]
+                + partial3[2 * HIDDEN_SIZE + hid];
+
+            const float i_r = input_step[hid];
+            const float i_z = input_step[HIDDEN_SIZE + hid];
+            const float i_n = input_step[2 * HIDDEN_SIZE + hid];
+            const float reset_gate = 1.0f / (1.0f + expf(-(i_r + acc_r)));
+            const float update_gate = 1.0f / (1.0f + expf(-(i_z + acc_z)));
+            const float new_gate = tanhf(i_n + reset_gate * acc_n);
+            const float hidden_prev = hidden[hid];
+            const float hidden_next = new_gate + update_gate * (hidden_prev - new_gate);
+            hidden[hid] = hidden_next;
+            output_step[hid] = hidden_next;
+            cache_step[hid] = reset_gate;
+            cache_step[HIDDEN_SIZE + hid] = update_gate;
+            cache_step[2 * HIDDEN_SIZE + hid] = new_gate;
+            cache_step[3 * HIDDEN_SIZE + hid] = acc_n;
+        }
+        grid.sync();
+    }
+}
+
+extern "C" __global__
+void a100_gru_forward_from_gates_cooperative_h256_cta8_shmem_gate_cache_kernel(
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ partial_gates,
+    float* __restrict__ hidden_state,
+    float* __restrict__ output,
+    float* __restrict__ gate_cache,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int CTAS_PER_BATCH = 8;
+    constexpr int K_TILE = HIDDEN_SIZE / CTAS_PER_BATCH;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+
+    extern __shared__ float shared[];
+    float* partial0_local = shared;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 3;
+    const int cta_idx = global_cta & (CTAS_PER_BATCH - 1);
+    const int tid = threadIdx.x;
+    const int warp_lane = tid & (WARP_SIZE - 1);
+    const int lane = tid & 15;
+    const int group_idx = tid / 16;
+    const int groups_per_block = blockDim.x / 16;
+    const unsigned int group_mask = 0xffffu << (warp_lane & 16);
+
+    float* hidden = hidden_state + batch_idx * HIDDEN_SIZE;
+    float* partial_base = partial_gates + global_cta * 3 * HIDDEN_SIZE;
+
+    if (cta_idx == 0) {
+        for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+            hidden[hid] = h0[batch_idx * HIDDEN_SIZE + hid];
+        }
+    }
+    grid.sync();
+
+    const int k_begin = cta_idx * K_TILE;
+
+    for (int step = 0; step < seq_len; ++step) {
+        const float* input_step = input_gates + (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE;
+        float* output_step = output + (batch_idx * seq_len + step) * HIDDEN_SIZE;
+        float* cache_step = gate_cache + (batch_idx * seq_len + step) * CACHE_SIZE;
+
+        // 8 CTA 版本提高 h256 forward 的常驻 CTA 数，验证 A100 SM 利用率是否受限。
+        for (int hid = group_idx; hid < HIDDEN_SIZE; hid += groups_per_block) {
+            const float* weight_r = weight_hh + hid * HIDDEN_SIZE + k_begin;
+            const float* weight_z = weight_hh + (HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            const float* weight_n = weight_hh + (2 * HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            float acc_r = 0.0f;
+            float acc_z = 0.0f;
+            float acc_n = 0.0f;
+
+#pragma unroll
+            for (int k_local = lane; k_local < K_TILE; k_local += 16) {
+                const int k = k_begin + k_local;
+                const float hidden_value = hidden[k];
+                acc_r += hidden_value * weight_r[k_local];
+                acc_z += hidden_value * weight_z[k_local];
+                acc_n += hidden_value * weight_n[k_local];
+            }
+
+            acc_r = half_warp_reduce_sum(acc_r, group_mask);
+            acc_z = half_warp_reduce_sum(acc_z, group_mask);
+            acc_n = half_warp_reduce_sum(acc_n, group_mask);
+
+            if (lane == 0) {
+                float* partial_out = (cta_idx == 0) ? partial0_local : partial_base;
+                partial_out[hid] = acc_r;
+                partial_out[HIDDEN_SIZE + hid] = acc_z;
+                partial_out[2 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+
+        if (cta_idx == 0) {
+            const float* partial1 = partial_gates
+                + (batch_idx * CTAS_PER_BATCH + 1) * 3 * HIDDEN_SIZE;
+            const float* partial2 = partial1 + 3 * HIDDEN_SIZE;
+            const float* partial3 = partial2 + 3 * HIDDEN_SIZE;
+            const float* partial4 = partial3 + 3 * HIDDEN_SIZE;
+            const float* partial5 = partial4 + 3 * HIDDEN_SIZE;
+            const float* partial6 = partial5 + 3 * HIDDEN_SIZE;
+            const float* partial7 = partial6 + 3 * HIDDEN_SIZE;
+
+            for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+                const float acc_r = bias_hh[hid]
+                    + partial0_local[hid]
+                    + partial1[hid]
+                    + partial2[hid]
+                    + partial3[hid]
+                    + partial4[hid]
+                    + partial5[hid]
+                    + partial6[hid]
+                    + partial7[hid];
+                const float acc_z = bias_hh[HIDDEN_SIZE + hid]
+                    + partial0_local[HIDDEN_SIZE + hid]
+                    + partial1[HIDDEN_SIZE + hid]
+                    + partial2[HIDDEN_SIZE + hid]
+                    + partial3[HIDDEN_SIZE + hid]
+                    + partial4[HIDDEN_SIZE + hid]
+                    + partial5[HIDDEN_SIZE + hid]
+                    + partial6[HIDDEN_SIZE + hid]
+                    + partial7[HIDDEN_SIZE + hid];
+                const float acc_n = bias_hh[2 * HIDDEN_SIZE + hid]
+                    + partial0_local[2 * HIDDEN_SIZE + hid]
+                    + partial1[2 * HIDDEN_SIZE + hid]
+                    + partial2[2 * HIDDEN_SIZE + hid]
+                    + partial3[2 * HIDDEN_SIZE + hid]
+                    + partial4[2 * HIDDEN_SIZE + hid]
+                    + partial5[2 * HIDDEN_SIZE + hid]
+                    + partial6[2 * HIDDEN_SIZE + hid]
+                    + partial7[2 * HIDDEN_SIZE + hid];
+
+                const float i_r = input_step[hid];
+                const float i_z = input_step[HIDDEN_SIZE + hid];
+                const float i_n = input_step[2 * HIDDEN_SIZE + hid];
+                const float reset_gate = 1.0f / (1.0f + expf(-(i_r + acc_r)));
+                const float update_gate = 1.0f / (1.0f + expf(-(i_z + acc_z)));
+                const float new_gate = tanhf(i_n + reset_gate * acc_n);
+                const float hidden_prev = hidden[hid];
+                const float hidden_next = new_gate + update_gate * (hidden_prev - new_gate);
+                hidden[hid] = hidden_next;
+                output_step[hid] = hidden_next;
+                cache_step[hid] = reset_gate;
+                cache_step[HIDDEN_SIZE + hid] = update_gate;
+                cache_step[2 * HIDDEN_SIZE + hid] = new_gate;
+                cache_step[3 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+    }
+}
+
+extern "C" __global__
+void a100_gru_forward_from_gates_cooperative_h256_cta6_shmem_gate_cache_kernel(
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ partial_gates,
+    float* __restrict__ hidden_state,
+    float* __restrict__ output,
+    float* __restrict__ gate_cache,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int CTAS_PER_BATCH = 6;
+    constexpr int K_TILE = 44;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+
+    extern __shared__ float shared[];
+    float* partial0_local = shared;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta / CTAS_PER_BATCH;
+    const int cta_idx = global_cta - batch_idx * CTAS_PER_BATCH;
+    const int tid = threadIdx.x;
+    const int warp_lane = tid & (WARP_SIZE - 1);
+    const int lane = tid & 15;
+    const int group_idx = tid / 16;
+    const int groups_per_block = blockDim.x / 16;
+    const unsigned int group_mask = 0xffffu << (warp_lane & 16);
+
+    float* hidden = hidden_state + batch_idx * HIDDEN_SIZE;
+    float* partial_base = partial_gates + global_cta * 3 * HIDDEN_SIZE;
+
+    if (cta_idx == 0) {
+        for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+            hidden[hid] = h0[batch_idx * HIDDEN_SIZE + hid];
+        }
+    }
+    grid.sync();
+
+    const int k_begin = cta_idx * K_TILE;
+    const int k_end = min(k_begin + K_TILE, HIDDEN_SIZE);
+
+    for (int step = 0; step < seq_len; ++step) {
+        const float* input_step = input_gates + (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE;
+        float* output_step = output + (batch_idx * seq_len + step) * HIDDEN_SIZE;
+        float* cache_step = gate_cache + (batch_idx * seq_len + step) * CACHE_SIZE;
+
+        // 6 CTA/batch 在 A100 上形成 96 个 resident blocks，比 4 CTA 更接近 SM 数。
+        for (int hid = group_idx; hid < HIDDEN_SIZE; hid += groups_per_block) {
+            const float* weight_r = weight_hh + hid * HIDDEN_SIZE + k_begin;
+            const float* weight_z = weight_hh + (HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            const float* weight_n = weight_hh + (2 * HIDDEN_SIZE + hid) * HIDDEN_SIZE + k_begin;
+            float acc_r = 0.0f;
+            float acc_z = 0.0f;
+            float acc_n = 0.0f;
+
+#pragma unroll
+            for (int k_local = lane; k_local < K_TILE; k_local += 16) {
+                const int k = k_begin + k_local;
+                if (k < k_end) {
+                    const float hidden_value = hidden[k];
+                    acc_r += hidden_value * weight_r[k_local];
+                    acc_z += hidden_value * weight_z[k_local];
+                    acc_n += hidden_value * weight_n[k_local];
+                }
+            }
+
+            acc_r = half_warp_reduce_sum(acc_r, group_mask);
+            acc_z = half_warp_reduce_sum(acc_z, group_mask);
+            acc_n = half_warp_reduce_sum(acc_n, group_mask);
+
+            if (lane == 0) {
+                float* partial_out = (cta_idx == 0) ? partial0_local : partial_base;
+                partial_out[hid] = acc_r;
+                partial_out[HIDDEN_SIZE + hid] = acc_z;
+                partial_out[2 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+
+        if (cta_idx == 0) {
+            const float* partial1 = partial_gates
+                + (batch_idx * CTAS_PER_BATCH + 1) * 3 * HIDDEN_SIZE;
+            const float* partial2 = partial1 + 3 * HIDDEN_SIZE;
+            const float* partial3 = partial2 + 3 * HIDDEN_SIZE;
+            const float* partial4 = partial3 + 3 * HIDDEN_SIZE;
+            const float* partial5 = partial4 + 3 * HIDDEN_SIZE;
+
+            for (int hid = tid; hid < HIDDEN_SIZE; hid += blockDim.x) {
+                const float acc_r = bias_hh[hid]
+                    + partial0_local[hid]
+                    + partial1[hid]
+                    + partial2[hid]
+                    + partial3[hid]
+                    + partial4[hid]
+                    + partial5[hid];
+                const float acc_z = bias_hh[HIDDEN_SIZE + hid]
+                    + partial0_local[HIDDEN_SIZE + hid]
+                    + partial1[HIDDEN_SIZE + hid]
+                    + partial2[HIDDEN_SIZE + hid]
+                    + partial3[HIDDEN_SIZE + hid]
+                    + partial4[HIDDEN_SIZE + hid]
+                    + partial5[HIDDEN_SIZE + hid];
+                const float acc_n = bias_hh[2 * HIDDEN_SIZE + hid]
+                    + partial0_local[2 * HIDDEN_SIZE + hid]
+                    + partial1[2 * HIDDEN_SIZE + hid]
+                    + partial2[2 * HIDDEN_SIZE + hid]
+                    + partial3[2 * HIDDEN_SIZE + hid]
+                    + partial4[2 * HIDDEN_SIZE + hid]
+                    + partial5[2 * HIDDEN_SIZE + hid];
+
+                const float i_r = input_step[hid];
+                const float i_z = input_step[HIDDEN_SIZE + hid];
+                const float i_n = input_step[2 * HIDDEN_SIZE + hid];
+                const float reset_gate = 1.0f / (1.0f + expf(-(i_r + acc_r)));
+                const float update_gate = 1.0f / (1.0f + expf(-(i_z + acc_z)));
+                const float new_gate = tanhf(i_n + reset_gate * acc_n);
+                const float hidden_prev = hidden[hid];
+                const float hidden_next = new_gate + update_gate * (hidden_prev - new_gate);
+                hidden[hid] = hidden_next;
+                output_step[hid] = hidden_next;
+                cache_step[hid] = reset_gate;
+                cache_step[HIDDEN_SIZE + hid] = update_gate;
+                cache_step[2 * HIDDEN_SIZE + hid] = new_gate;
+                cache_step[3 * HIDDEN_SIZE + hid] = acc_n;
+            }
+        }
+        grid.sync();
+    }
+}
+
+extern "C" __global__
 void a100_gru_forward_from_gates_cooperative_h256_qwarp_shmem_kernel(
     const float* __restrict__ input_gates,
     const float* __restrict__ h0,
@@ -1086,6 +1731,2468 @@ void a100_gru_forward_from_gates_cooperative_h256_cached_shmem_kernel(
         }
         grid.sync();
     }
+}
+
+extern "C" __global__
+void a100_gru_h256_pointwise_backward_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ grad_hidden_prev_direct,
+    int batch_size,
+    int seq_len,
+    int step)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = batch_size * HIDDEN_SIZE;
+    if (idx >= total) {
+        return;
+    }
+
+    const int batch_idx = idx / HIDDEN_SIZE;
+    const int hid = idx - batch_idx * HIDDEN_SIZE;
+    const int input_base = (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE + hid;
+    const int gates_base = batch_idx * 3 * HIDDEN_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    const float i_r = input_gates[input_base];
+    const float i_z = input_gates[input_base + HIDDEN_SIZE];
+    const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+    const float h_r = hidden_gates[gates_base];
+    const float h_z = hidden_gates[gates_base + HIDDEN_SIZE];
+    const float h_n = hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    const float h_prev = (step == 0)
+        ? h0[hidden_base]
+        : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+    const float grad_out = grad_hidden_next[hidden_base];
+
+    const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+    const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+    const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+    // gate 顺序与 PyTorch GRU 保持一致：r, z, n。
+    const float grad_update = grad_out * (h_prev - new_gate);
+    const float grad_new = grad_out * (1.0f - update_gate);
+    const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+    const float grad_reset = grad_new_pre * h_n;
+    const float grad_recurrent_n = grad_new_pre * reset_gate;
+    const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+    const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+
+    grad_input_gates[input_base] = grad_reset_pre;
+    grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+    grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+    grad_hidden_gates[gates_base] = grad_reset_pre;
+    grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+    grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+    grad_hidden_prev_direct[hidden_base] = grad_out * update_gate;
+}
+
+extern "C" __global__
+void a100_gru_h256_recurrent_backward_kernel(
+    const float* __restrict__ grad_hidden_gates,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ grad_hidden_prev_direct,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+
+    extern __shared__ float shared_grad_gates[];
+
+    const int batch_idx = blockIdx.x;
+    const int hid = threadIdx.x;
+    if (batch_idx >= batch_size || hid >= HIDDEN_SIZE) {
+        return;
+    }
+
+    const float* grad_gates_base = grad_hidden_gates + batch_idx * GATES_SIZE;
+    for (int gate_idx = hid; gate_idx < GATES_SIZE; gate_idx += HIDDEN_SIZE) {
+        shared_grad_gates[gate_idx] = grad_gates_base[gate_idx];
+    }
+    __syncthreads();
+
+    float acc = grad_hidden_prev_direct[batch_idx * HIDDEN_SIZE + hid];
+
+#pragma unroll 3
+    for (int gate_block = 0; gate_block < GATES_SIZE; gate_block += HIDDEN_SIZE) {
+#pragma unroll 4
+        for (int k = 0; k < HIDDEN_SIZE; ++k) {
+            const int gate_idx = gate_block + k;
+            acc += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+    }
+
+    grad_hidden_prev[batch_idx * HIDDEN_SIZE + hid] = acc;
+}
+
+extern "C" __global__
+void a100_gru_h256_recurrent_backward_tiled_kernel(
+    const float* __restrict__ grad_hidden_gates,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ grad_hidden_prev_direct,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int TILE_BATCH = 16;
+    constexpr int TILE_HIDDEN = 16;
+    constexpr int TILE_K = 32;
+
+    extern __shared__ float shared[];
+    float* shared_gates = shared;
+    float* shared_weight = shared + TILE_BATCH * TILE_K;
+
+    const int hidden_col = blockIdx.x * TILE_HIDDEN + threadIdx.x;
+    const int batch_idx = blockIdx.y * TILE_BATCH + threadIdx.y;
+    const int linear_tid = threadIdx.y * TILE_HIDDEN + threadIdx.x;
+
+    float acc = 0.0f;
+    if (batch_idx < batch_size && hidden_col < HIDDEN_SIZE) {
+        acc = grad_hidden_prev_direct[batch_idx * HIDDEN_SIZE + hidden_col];
+    }
+
+    for (int k_base = 0; k_base < GATES_SIZE; k_base += TILE_K) {
+        for (int offset = linear_tid; offset < TILE_BATCH * TILE_K; offset += TILE_BATCH * TILE_HIDDEN) {
+            const int batch_row = offset / TILE_K;
+            const int k_inner = offset - batch_row * TILE_K;
+            const int load_batch = blockIdx.y * TILE_BATCH + batch_row;
+            const int gate_idx = k_base + k_inner;
+            shared_gates[offset] = (load_batch < batch_size)
+                ? grad_hidden_gates[load_batch * GATES_SIZE + gate_idx]
+                : 0.0f;
+        }
+        for (int offset = linear_tid; offset < TILE_K * TILE_HIDDEN; offset += TILE_BATCH * TILE_HIDDEN) {
+            const int k_inner = offset / TILE_HIDDEN;
+            const int hidden_inner = offset - k_inner * TILE_HIDDEN;
+            const int gate_idx = k_base + k_inner;
+            const int load_hidden = blockIdx.x * TILE_HIDDEN + hidden_inner;
+            shared_weight[offset] = weight_hh[gate_idx * HIDDEN_SIZE + load_hidden];
+        }
+        __syncthreads();
+
+        if (batch_idx < batch_size && hidden_col < HIDDEN_SIZE) {
+#pragma unroll
+            for (int k_inner = 0; k_inner < TILE_K; ++k_inner) {
+                acc += shared_gates[threadIdx.y * TILE_K + k_inner]
+                    * shared_weight[k_inner * TILE_HIDDEN + threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (batch_idx < batch_size && hidden_col < HIDDEN_SIZE) {
+        grad_hidden_prev[batch_idx * HIDDEN_SIZE + hidden_col] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_recurrent_backward_split_kernel(
+    const float* __restrict__ grad_hidden_gates,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ partial_sums,
+    int batch_size,
+    int split_count)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int TILE_BATCH = 16;
+    constexpr int TILE_HIDDEN = 16;
+    constexpr int TILE_K = 32;
+
+    extern __shared__ float shared[];
+    float* shared_gates = shared;
+    float* shared_weight = shared + TILE_BATCH * TILE_K;
+
+    const int split_idx = blockIdx.z;
+    const int split_size = (GATES_SIZE + split_count - 1) / split_count;
+    const int split_begin = split_idx * split_size;
+    const int split_end = min(split_begin + split_size, GATES_SIZE);
+    const int hidden_col = blockIdx.x * TILE_HIDDEN + threadIdx.x;
+    const int batch_idx = blockIdx.y * TILE_BATCH + threadIdx.y;
+    const int linear_tid = threadIdx.y * TILE_HIDDEN + threadIdx.x;
+
+    float acc = 0.0f;
+    for (int k_base = split_begin; k_base < split_end; k_base += TILE_K) {
+        const int k_limit = min(k_base + TILE_K, split_end);
+        const int current_tile_k = k_limit - k_base;
+
+        for (int offset = linear_tid; offset < TILE_BATCH * TILE_K; offset += TILE_BATCH * TILE_HIDDEN) {
+            const int batch_row = offset / TILE_K;
+            const int k_inner = offset - batch_row * TILE_K;
+            const int load_batch = blockIdx.y * TILE_BATCH + batch_row;
+            const int gate_idx = k_base + k_inner;
+            shared_gates[offset] = (load_batch < batch_size && k_inner < current_tile_k)
+                ? grad_hidden_gates[load_batch * GATES_SIZE + gate_idx]
+                : 0.0f;
+        }
+        for (int offset = linear_tid; offset < TILE_K * TILE_HIDDEN; offset += TILE_BATCH * TILE_HIDDEN) {
+            const int k_inner = offset / TILE_HIDDEN;
+            const int hidden_inner = offset - k_inner * TILE_HIDDEN;
+            const int gate_idx = k_base + k_inner;
+            const int load_hidden = blockIdx.x * TILE_HIDDEN + hidden_inner;
+            shared_weight[offset] = (k_inner < current_tile_k)
+                ? weight_hh[gate_idx * HIDDEN_SIZE + load_hidden]
+                : 0.0f;
+        }
+        __syncthreads();
+
+        if (batch_idx < batch_size && hidden_col < HIDDEN_SIZE) {
+#pragma unroll
+            for (int k_inner = 0; k_inner < TILE_K; ++k_inner) {
+                acc += shared_gates[threadIdx.y * TILE_K + k_inner]
+                    * shared_weight[k_inner * TILE_HIDDEN + threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (batch_idx < batch_size && hidden_col < HIDDEN_SIZE) {
+        partial_sums[(split_idx * batch_size + batch_idx) * HIDDEN_SIZE + hidden_col] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_recurrent_backward_split_reduce_kernel(
+    const float* __restrict__ partial_sums,
+    const float* __restrict__ grad_hidden_prev_direct,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int split_count)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = batch_size * HIDDEN_SIZE;
+    if (idx >= total) {
+        return;
+    }
+
+    const int batch_idx = idx / HIDDEN_SIZE;
+    const int hid = idx - batch_idx * HIDDEN_SIZE;
+    float acc = grad_hidden_prev_direct[idx];
+#pragma unroll
+    for (int split_idx = 0; split_idx < 8; ++split_idx) {
+        if (split_idx < split_count) {
+            acc += partial_sums[(split_idx * batch_size + batch_idx) * HIDDEN_SIZE + hid];
+        }
+    }
+    grad_hidden_prev[idx] = acc;
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+
+    extern __shared__ float shared_grad_gates[];
+
+    const int batch_idx = blockIdx.x;
+    const int hid = threadIdx.x;
+    if (batch_idx >= batch_size || hid >= HIDDEN_SIZE) {
+        return;
+    }
+
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    const float i_r = input_gates[input_base];
+    const float i_z = input_gates[input_base + HIDDEN_SIZE];
+    const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+    const float h_r = hidden_gates[gates_base];
+    const float h_z = hidden_gates[gates_base + HIDDEN_SIZE];
+    const float h_n = hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    const float h_prev = (step == 0)
+        ? h0[hidden_base]
+        : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+    const float grad_out = grad_hidden_next[hidden_base];
+
+    const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+    const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+    const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+    // 先在每个 hidden lane 中完成 GRU gate 的逐元素反向。
+    const float grad_update = grad_out * (h_prev - new_gate);
+    const float grad_new = grad_out * (1.0f - update_gate);
+    const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+    const float grad_reset = grad_new_pre * h_n;
+    const float grad_recurrent_n = grad_new_pre * reset_gate;
+    const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+    const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+    const float grad_hidden_prev_direct = grad_out * update_gate;
+
+    shared_grad_gates[hid] = grad_reset_pre;
+    shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+    shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+    grad_input_gates[input_base] = grad_reset_pre;
+    grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+    grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+    grad_hidden_gates[gates_base] = grad_reset_pre;
+    grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+    grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+    __syncthreads();
+
+    float acc = grad_hidden_prev_direct;
+#pragma unroll 3
+    for (int gate_block = 0; gate_block < GATES_SIZE; gate_block += HIDDEN_SIZE) {
+#pragma unroll 4
+        for (int k = 0; k < HIDDEN_SIZE; ++k) {
+            const int gate_idx = gate_block + k;
+            acc += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+    }
+
+    grad_hidden_prev[hidden_base] = acc;
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_cooperative_split_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step,
+    int split_count)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta / split_count;
+    const int split_idx = global_cta - batch_idx * split_count;
+    const int hid = threadIdx.x;
+
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    const float i_r = input_gates[input_base];
+    const float i_z = input_gates[input_base + HIDDEN_SIZE];
+    const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+    const float h_r = hidden_gates[gates_base];
+    const float h_z = hidden_gates[gates_base + HIDDEN_SIZE];
+    const float h_n = hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    const float h_prev = (step == 0)
+        ? h0[hidden_base]
+        : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+    const float grad_out = grad_hidden_next[hidden_base];
+
+    const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+    const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+    const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+    // 每个 split CTA 都重算 pointwise 梯度，避免额外的跨 CTA 读依赖。
+    const float grad_update = grad_out * (h_prev - new_gate);
+    const float grad_new = grad_out * (1.0f - update_gate);
+    const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+    const float grad_reset = grad_new_pre * h_n;
+    const float grad_recurrent_n = grad_new_pre * reset_gate;
+    const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+    const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+    const float grad_hidden_prev_direct = grad_out * update_gate;
+
+    shared_grad_gates[hid] = grad_reset_pre;
+    shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+    shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+    if (split_idx == 0) {
+        grad_input_gates[input_base] = grad_reset_pre;
+        grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+        grad_hidden_gates[gates_base] = grad_reset_pre;
+        grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+    }
+    __syncthreads();
+
+    const int split_size = (GATES_SIZE + split_count - 1) / split_count;
+    const int split_begin = split_idx * split_size;
+    const int split_end = min(split_begin + split_size, GATES_SIZE);
+
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+        partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+    }
+    partial_sums[(batch_idx * split_count + split_idx) * HIDDEN_SIZE + hid] = partial;
+    grid.sync();
+
+    if (split_idx == 0) {
+        float acc = grad_hidden_prev_direct;
+#pragma unroll
+        for (int reduce_idx = 0; reduce_idx < 8; ++reduce_idx) {
+            if (reduce_idx < split_count) {
+                acc += partial_sums[(batch_idx * split_count + reduce_idx) * HIDDEN_SIZE + hid];
+            }
+        }
+        grad_hidden_prev[hidden_base] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_cooperative_split2_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 2;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 1;
+    const int split_idx = global_cta & 1;
+    const int hid = threadIdx.x;
+
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    const float i_r = input_gates[input_base];
+    const float i_z = input_gates[input_base + HIDDEN_SIZE];
+    const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+    const float h_r = hidden_gates[gates_base];
+    const float h_z = hidden_gates[gates_base + HIDDEN_SIZE];
+    const float h_n = hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    const float h_prev = (step == 0)
+        ? h0[hidden_base]
+        : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+    const float grad_out = grad_hidden_next[hidden_base];
+
+    const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+    const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+    const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+    // split2 专用版本：保留重复 pointwise，避免额外 grid sync。
+    const float grad_update = grad_out * (h_prev - new_gate);
+    const float grad_new = grad_out * (1.0f - update_gate);
+    const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+    const float grad_reset = grad_new_pre * h_n;
+    const float grad_recurrent_n = grad_new_pre * reset_gate;
+    const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+    const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+    const float grad_hidden_prev_direct = grad_out * update_gate;
+
+    shared_grad_gates[hid] = grad_reset_pre;
+    shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+    shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+    if (split_idx == 0) {
+        grad_input_gates[input_base] = grad_reset_pre;
+        grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+        grad_hidden_gates[gates_base] = grad_reset_pre;
+        grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+    }
+    __syncthreads();
+
+    const int split_begin = split_idx * SPLIT_SIZE;
+    const int split_end = split_begin + SPLIT_SIZE;
+
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+        partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+    }
+    partial_sums[(batch_idx * SPLIT_COUNT + split_idx) * HIDDEN_SIZE + hid] = partial;
+    grid.sync();
+
+    if (split_idx == 0) {
+        const float acc = grad_hidden_prev_direct
+            + partial_sums[batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid]
+            + partial_sums[(batch_idx * SPLIT_COUNT + 1) * HIDDEN_SIZE + hid];
+        grad_hidden_prev[hidden_base] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_cooperative_split_cached_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step,
+    int split_count)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta / split_count;
+    const int split_idx = global_cta - batch_idx * split_count;
+    const int hid = threadIdx.x;
+
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    float grad_hidden_prev_direct = 0.0f;
+    if (split_idx == 0) {
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates[gates_base];
+        const float h_z = hidden_gates[gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+        const float grad_out = grad_hidden_next[hidden_base];
+
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+        // 只在 split0 计算一次 pointwise backward，后续 split CTA 复用全局 gate 梯度。
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        grad_hidden_prev_direct = grad_out * update_gate;
+
+        grad_input_gates[input_base] = grad_reset_pre;
+        grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+        grad_hidden_gates[gates_base] = grad_reset_pre;
+        grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+    }
+    grid.sync();
+
+    shared_grad_gates[hid] = grad_hidden_gates[gates_base];
+    shared_grad_gates[hid + HIDDEN_SIZE] = grad_hidden_gates[gates_base + HIDDEN_SIZE];
+    shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    __syncthreads();
+
+    const int split_size = (GATES_SIZE + split_count - 1) / split_count;
+    const int split_begin = split_idx * split_size;
+    const int split_end = min(split_begin + split_size, GATES_SIZE);
+
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+        partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+    }
+    partial_sums[(batch_idx * split_count + split_idx) * HIDDEN_SIZE + hid] = partial;
+    grid.sync();
+
+    if (split_idx == 0) {
+        float acc = grad_hidden_prev_direct;
+#pragma unroll
+        for (int reduce_idx = 0; reduce_idx < 8; ++reduce_idx) {
+            if (reduce_idx < split_count) {
+                acc += partial_sums[(batch_idx * split_count + reduce_idx) * HIDDEN_SIZE + hid];
+            }
+        }
+        grad_hidden_prev[hidden_base] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_cooperative_split2_cached_local_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 2;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 1;
+    const int split_idx = global_cta & 1;
+    const int hid = threadIdx.x;
+
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    float grad_hidden_prev_direct = 0.0f;
+    if (split_idx == 0) {
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates[gates_base];
+        const float h_z = hidden_gates[gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+        const float grad_out = grad_hidden_next[hidden_base];
+
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+        // split0 保留 gate 梯度在本 CTA shared 中，避免自己再从全局读回。
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        grad_input_gates[input_base] = grad_reset_pre;
+        grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+        grad_hidden_gates[gates_base] = grad_reset_pre;
+        grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+    }
+    grid.sync();
+
+    if (split_idx != 0) {
+        shared_grad_gates[hid] = grad_hidden_gates[gates_base];
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_hidden_gates[gates_base + HIDDEN_SIZE];
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    }
+    __syncthreads();
+
+    const int split_begin = split_idx * SPLIT_SIZE;
+    const int split_end = split_begin + SPLIT_SIZE;
+
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+        partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+    }
+    partial_sums[(batch_idx * SPLIT_COUNT + split_idx) * HIDDEN_SIZE + hid] = partial;
+    grid.sync();
+
+    if (split_idx == 0) {
+        const float acc = grad_hidden_prev_direct
+            + partial_sums[batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid]
+            + partial_sums[(batch_idx * SPLIT_COUNT + 1) * HIDDEN_SIZE + hid];
+        grad_hidden_prev[hidden_base] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_cooperative_split2_gate_cache_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ gate_cache,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 2;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 1;
+    const int split_idx = global_cta & 1;
+    const int hid = threadIdx.x;
+
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    float grad_hidden_prev_direct = 0.0f;
+    if (split_idx == 0) {
+        const float reset_gate = gate_cache[cache_base];
+        const float update_gate = gate_cache[cache_base + HIDDEN_SIZE];
+        const float new_gate = gate_cache[cache_base + 2 * HIDDEN_SIZE];
+        const float recurrent_new = gate_cache[cache_base + 3 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+        const float grad_out = grad_hidden_next[hidden_base];
+
+        // gate_cache 让 backward 避免重新计算 sigmoid/tanh 和读取 hidden_gates。
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * recurrent_new;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        grad_input_gates[input_base] = grad_reset_pre;
+        grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+        grad_hidden_gates[gates_base] = grad_reset_pre;
+        grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+        grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+    }
+    grid.sync();
+
+    if (split_idx != 0) {
+        shared_grad_gates[hid] = grad_hidden_gates[gates_base];
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_hidden_gates[gates_base + HIDDEN_SIZE];
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE];
+    }
+    __syncthreads();
+
+    const int split_begin = split_idx * SPLIT_SIZE;
+    const int split_end = split_begin + SPLIT_SIZE;
+
+    float partial = 0.0f;
+#pragma unroll 4
+    for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+        partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+    }
+    partial_sums[(batch_idx * SPLIT_COUNT + split_idx) * HIDDEN_SIZE + hid] = partial;
+    grid.sync();
+
+    if (split_idx == 0) {
+        const float acc = grad_hidden_prev_direct
+            + partial_sums[batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid]
+            + partial_sums[(batch_idx * SPLIT_COUNT + 1) * HIDDEN_SIZE + hid];
+        grad_hidden_prev[hidden_base] = acc;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split2_cached_local_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 2;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 1;
+    const int split_idx = global_cta & 1;
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        float grad_hidden_prev_direct = 0.0f;
+        if (split_idx == 0) {
+            const float i_r = input_gates[input_base];
+            const float i_z = input_gates[input_base + HIDDEN_SIZE];
+            const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+            const float h_r = hidden_gates_steps[step_gates_base];
+            const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+            const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+            const float h_prev = (step == 0)
+                ? h0[hidden_base]
+                : output[output_base - HIDDEN_SIZE];
+            const float grad_out = grad_hidden_state[hidden_base] + grad_output[output_base];
+
+            // persistent 版本把 time loop 放入一个 kernel，减少每步 launch 间隙。
+            const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+            const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+            const float new_gate = tanhf(i_n + reset_gate * h_n);
+            const float grad_update = grad_out * (h_prev - new_gate);
+            const float grad_new = grad_out * (1.0f - update_gate);
+            const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+            const float grad_reset = grad_new_pre * h_n;
+            const float grad_recurrent_n = grad_new_pre * reset_gate;
+            const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+            const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+            grad_hidden_prev_direct = grad_out * update_gate;
+
+            shared_grad_gates[hid] = grad_reset_pre;
+            shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+            shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        grid.sync();
+
+        if (split_idx != 0) {
+            shared_grad_gates[hid] = grad_hidden_gates_steps[step_gates_base];
+            shared_grad_gates[hid + HIDDEN_SIZE] = (
+                grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE]
+            );
+            shared_grad_gates[hid + 2 * HIDDEN_SIZE] = (
+                grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE]
+            );
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = split_begin + SPLIT_SIZE;
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        partial_sums[(batch_idx * SPLIT_COUNT + split_idx) * HIDDEN_SIZE + hid] = partial;
+        grid.sync();
+
+        if (split_idx == 0) {
+            grad_hidden_state[hidden_base] = grad_hidden_prev_direct
+                + partial_sums[batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid]
+                + partial_sums[(batch_idx * SPLIT_COUNT + 1) * HIDDEN_SIZE + hid];
+        }
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split2_state_parts_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 2;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 1;
+    const int split_idx = global_cta & 1;
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates_steps[step_gates_base];
+        const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // 两个 split 都重算 pointwise，换掉 cached-local 路径中的第一次 grid.sync。
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = split_begin + SPLIT_SIZE;
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split2_state_local_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 2;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 1;
+    const int split_idx = global_cta & 1;
+    const int other_split_idx = split_idx ^ 1;
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+    float local_state_part = 0.0f;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = local_state_part
+                + partial_sums[partial_base + other_split_idx * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates_steps[step_gates_base];
+        const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // 每个 split 在寄存器里保留自己的 state partial，下一步只读对侧 partial。
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = split_begin + SPLIT_SIZE;
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        local_state_part = partial;
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = local_state_part;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = local_state_part + partial_sums[partial_base + HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split4_state_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 4;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 2;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE]
+                + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 3 * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates_steps[step_gates_base];
+        const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // split4 继续保持每步一次 grid.sync，用更多 CTA 降低 recurrent dot-product 长度。
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = split_begin + SPLIT_SIZE;
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split8_state_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 8;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 3;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE]
+                + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 7 * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates_steps[step_gates_base];
+        const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // split8 用更多 CTA 继续缩短 recurrent dot-product，验证并行度上限。
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = split_begin + SPLIT_SIZE;
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split16_state_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 16;
+    constexpr int SPLIT_SIZE = (GATES_SIZE + SPLIT_COUNT - 1) / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 4;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE]
+                + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates_steps[step_gates_base];
+        const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // split16 验证更多 CTA 是否还能抵消重复 pointwise 和 partial 规约。
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = min(split_begin + SPLIT_SIZE, GATES_SIZE);
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ gate_cache,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 16;
+    constexpr int SPLIT_SIZE = (GATES_SIZE + SPLIT_COUNT - 1) / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 4;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE]
+                + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float reset_gate = gate_cache[cache_base];
+        const float update_gate = gate_cache[cache_base + HIDDEN_SIZE];
+        const float new_gate = gate_cache[cache_base + 2 * HIDDEN_SIZE];
+        const float recurrent_new = gate_cache[cache_base + 3 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // 复用 forward 保存的 gate activation，避免 backward 重算 hidden gates 和 exp/tanh。
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * recurrent_new;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = min(split_begin + SPLIT_SIZE, GATES_SIZE);
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ gate_cache,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 16;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 4;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_prev_direct = 0.0f;
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        if (split_idx == 0) {
+            float grad_hidden_acc = 0.0f;
+            if (step == seq_len - 1) {
+                grad_hidden_acc = grad_hidden_state[hidden_base];
+            } else {
+                grad_hidden_acc = partial_sums[partial_base]
+                    + partial_sums[partial_base + HIDDEN_SIZE]
+                    + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+            }
+
+            const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + hid;
+            const float reset_gate = gate_cache[cache_base];
+            const float update_gate = gate_cache[cache_base + HIDDEN_SIZE];
+            const float new_gate = gate_cache[cache_base + 2 * HIDDEN_SIZE];
+            const float recurrent_new = gate_cache[cache_base + 3 * HIDDEN_SIZE];
+            const float h_prev = (step == 0)
+                ? h0[hidden_base]
+                : output[output_base - HIDDEN_SIZE];
+            const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+            // split0 负责完整写出 gate 梯度，供后续大 GEMM 计算 weight_hh 梯度。
+            const float grad_update = grad_out * (h_prev - new_gate);
+            const float grad_new = grad_out * (1.0f - update_gate);
+            const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+            const float grad_reset = grad_new_pre * recurrent_new;
+            const float grad_recurrent_n = grad_new_pre * reset_gate;
+            const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+            const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+            grad_hidden_prev_direct = grad_out * update_gate;
+
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+            if (hid < SPLIT_SIZE) {
+                shared_grad_gates[hid] = grad_reset_pre;
+            }
+        } else if (hid < SPLIT_SIZE) {
+            const int gate_idx = split_idx * SPLIT_SIZE + hid;
+            const int gate_type = gate_idx / HIDDEN_SIZE;
+            const int gate_hid = gate_idx - gate_type * HIDDEN_SIZE;
+            const int gate_hidden_base = batch_idx * HIDDEN_SIZE + gate_hid;
+            const int gate_partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + gate_hid;
+            const int gate_output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + gate_hid;
+
+            float grad_hidden_acc = 0.0f;
+            if (step == seq_len - 1) {
+                grad_hidden_acc = grad_hidden_state[gate_hidden_base];
+            } else {
+                grad_hidden_acc = partial_sums[gate_partial_base]
+                    + partial_sums[gate_partial_base + HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 2 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 3 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 4 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 5 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 6 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 7 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 8 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 9 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 10 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 11 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 12 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 13 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 14 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 15 * HIDDEN_SIZE];
+            }
+
+            const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + gate_hid;
+            const float reset_gate = gate_cache[cache_base];
+            const float update_gate = gate_cache[cache_base + HIDDEN_SIZE];
+            const float new_gate = gate_cache[cache_base + 2 * HIDDEN_SIZE];
+            const float recurrent_new = gate_cache[cache_base + 3 * HIDDEN_SIZE];
+            const float h_prev = (step == 0)
+                ? h0[gate_hidden_base]
+                : output[gate_output_base - HIDDEN_SIZE];
+            const float grad_out = grad_hidden_acc + grad_output[gate_output_base];
+
+            // 其它 split 只计算本 split recurrent dot-product 需要的 48 个 gate 梯度。
+            const float grad_update = grad_out * (h_prev - new_gate);
+            const float grad_new = grad_out * (1.0f - update_gate);
+            const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+            const float grad_reset = grad_new_pre * recurrent_new;
+            const float grad_recurrent_n = grad_new_pre * reset_gate;
+            const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+            const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+
+            float local_grad = grad_reset_pre;
+            if (gate_type == 1) {
+                local_grad = grad_update_pre;
+            } else if (gate_type == 2) {
+                local_grad = grad_recurrent_n;
+            }
+            shared_grad_gates[hid] = local_grad;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int local_idx = 0; local_idx < SPLIT_SIZE; ++local_idx) {
+            const int gate_idx = split_begin + local_idx;
+            partial += shared_grad_gates[local_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split16_grad_coeff_cache_state_tiled_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ grad_coeff_cache,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int CACHE_SIZE = 5 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 16;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 4;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_prev_direct = 0.0f;
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        if (split_idx == 0) {
+            float grad_hidden_acc = 0.0f;
+            if (step == seq_len - 1) {
+                grad_hidden_acc = grad_hidden_state[hidden_base];
+            } else {
+                grad_hidden_acc = partial_sums[partial_base]
+                    + partial_sums[partial_base + HIDDEN_SIZE]
+                    + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+                    + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+            }
+
+            const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + hid;
+            const float grad_out = grad_hidden_acc + grad_output[output_base];
+            const float grad_reset_pre = grad_out * grad_coeff_cache[cache_base];
+            const float grad_update_pre = grad_out
+                * grad_coeff_cache[cache_base + HIDDEN_SIZE];
+            const float grad_new_pre = grad_out
+                * grad_coeff_cache[cache_base + 2 * HIDDEN_SIZE];
+            const float grad_recurrent_n = grad_out
+                * grad_coeff_cache[cache_base + 3 * HIDDEN_SIZE];
+            grad_hidden_prev_direct = grad_out
+                * grad_coeff_cache[cache_base + 4 * HIDDEN_SIZE];
+
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+            if (hid < SPLIT_SIZE) {
+                shared_grad_gates[hid] = grad_reset_pre;
+            }
+        } else if (hid < SPLIT_SIZE) {
+            const int gate_idx = split_idx * SPLIT_SIZE + hid;
+            const int gate_type = gate_idx / HIDDEN_SIZE;
+            const int gate_hid = gate_idx - gate_type * HIDDEN_SIZE;
+            const int gate_hidden_base = batch_idx * HIDDEN_SIZE + gate_hid;
+            const int gate_partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + gate_hid;
+            const int gate_output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + gate_hid;
+
+            float grad_hidden_acc = 0.0f;
+            if (step == seq_len - 1) {
+                grad_hidden_acc = grad_hidden_state[gate_hidden_base];
+            } else {
+                grad_hidden_acc = partial_sums[gate_partial_base]
+                    + partial_sums[gate_partial_base + HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 2 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 3 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 4 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 5 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 6 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 7 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 8 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 9 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 10 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 11 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 12 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 13 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 14 * HIDDEN_SIZE]
+                    + partial_sums[gate_partial_base + 15 * HIDDEN_SIZE];
+            }
+
+            const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + gate_hid;
+            const float grad_out = grad_hidden_acc + grad_output[gate_output_base];
+            float local_grad = grad_out * grad_coeff_cache[cache_base];
+            if (gate_type == 1) {
+                local_grad = grad_out * grad_coeff_cache[cache_base + HIDDEN_SIZE];
+            } else if (gate_type == 2) {
+                local_grad = grad_out * grad_coeff_cache[cache_base + 3 * HIDDEN_SIZE];
+            }
+            shared_grad_gates[hid] = local_grad;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int local_idx = 0; local_idx < SPLIT_SIZE; ++local_idx) {
+            const int gate_idx = split_begin + local_idx;
+            partial += shared_grad_gates[local_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split32_gate_cache_state_tiled_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ gate_cache,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int CACHE_SIZE = 4 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 32;
+    constexpr int SPLIT_SIZE = GATES_SIZE / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 5;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_prev_direct = 0.0f;
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        if (split_idx == 0) {
+            float grad_hidden_acc = 0.0f;
+            if (step == seq_len - 1) {
+                grad_hidden_acc = grad_hidden_state[hidden_base];
+            } else {
+#pragma unroll
+                for (int split = 0; split < SPLIT_COUNT; ++split) {
+                    grad_hidden_acc += partial_sums[partial_base + split * HIDDEN_SIZE];
+                }
+            }
+
+            const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + hid;
+            const float reset_gate = gate_cache[cache_base];
+            const float update_gate = gate_cache[cache_base + HIDDEN_SIZE];
+            const float new_gate = gate_cache[cache_base + 2 * HIDDEN_SIZE];
+            const float recurrent_new = gate_cache[cache_base + 3 * HIDDEN_SIZE];
+            const float h_prev = (step == 0)
+                ? h0[hidden_base]
+                : output[output_base - HIDDEN_SIZE];
+            const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+            const float grad_update = grad_out * (h_prev - new_gate);
+            const float grad_new = grad_out * (1.0f - update_gate);
+            const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+            const float grad_reset = grad_new_pre * recurrent_new;
+            const float grad_recurrent_n = grad_new_pre * reset_gate;
+            const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+            const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+            grad_hidden_prev_direct = grad_out * update_gate;
+
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+            if (hid < SPLIT_SIZE) {
+                shared_grad_gates[hid] = grad_reset_pre;
+            }
+        } else if (hid < SPLIT_SIZE) {
+            const int gate_idx = split_idx * SPLIT_SIZE + hid;
+            const int gate_type = gate_idx / HIDDEN_SIZE;
+            const int gate_hid = gate_idx - gate_type * HIDDEN_SIZE;
+            const int gate_hidden_base = batch_idx * HIDDEN_SIZE + gate_hid;
+            const int gate_partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + gate_hid;
+            const int gate_output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + gate_hid;
+
+            float grad_hidden_acc = 0.0f;
+            if (step == seq_len - 1) {
+                grad_hidden_acc = grad_hidden_state[gate_hidden_base];
+            } else {
+#pragma unroll
+                for (int split = 0; split < SPLIT_COUNT; ++split) {
+                    grad_hidden_acc += partial_sums[gate_partial_base + split * HIDDEN_SIZE];
+                }
+            }
+
+            const int cache_base = (batch_idx * seq_len + step) * CACHE_SIZE + gate_hid;
+            const float reset_gate = gate_cache[cache_base];
+            const float update_gate = gate_cache[cache_base + HIDDEN_SIZE];
+            const float new_gate = gate_cache[cache_base + 2 * HIDDEN_SIZE];
+            const float recurrent_new = gate_cache[cache_base + 3 * HIDDEN_SIZE];
+            const float h_prev = (step == 0)
+                ? h0[gate_hidden_base]
+                : output[gate_output_base - HIDDEN_SIZE];
+            const float grad_out = grad_hidden_acc + grad_output[gate_output_base];
+
+            const float grad_update = grad_out * (h_prev - new_gate);
+            const float grad_new = grad_out * (1.0f - update_gate);
+            const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+            const float grad_reset = grad_new_pre * recurrent_new;
+            const float grad_recurrent_n = grad_new_pre * reset_gate;
+            const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+            const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+
+            float local_grad = grad_reset_pre;
+            if (gate_type == 1) {
+                local_grad = grad_update_pre;
+            } else if (gate_type == 2) {
+                local_grad = grad_recurrent_n;
+            }
+            shared_grad_gates[hid] = local_grad;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int local_idx = 0; local_idx < SPLIT_SIZE; ++local_idx) {
+            const int gate_idx = split_begin + local_idx;
+            partial += shared_grad_gates[local_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        float grad_hidden = 0.0f;
+#pragma unroll
+        for (int split = 0; split < SPLIT_COUNT; ++split) {
+            grad_hidden += partial_sums[partial_base + split * HIDDEN_SIZE];
+        }
+        grad_hidden_state[hidden_base] = grad_hidden;
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split16_state_global_gates_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 16;
+    constexpr int SPLIT_SIZE = (GATES_SIZE + SPLIT_COUNT - 1) / SPLIT_COUNT;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 4;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE]
+                + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_start = (step * batch_size + batch_idx) * GATES_SIZE;
+        const int step_gates_base = step_gates_start + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+        float grad_hidden_prev_direct = 0.0f;
+
+        if (split_idx == 0) {
+            const float i_r = input_gates[input_base];
+            const float i_z = input_gates[input_base + HIDDEN_SIZE];
+            const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+            const float h_r = hidden_gates_steps[step_gates_base];
+            const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+            const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+            const float h_prev = (step == 0)
+                ? h0[hidden_base]
+                : output[output_base - HIDDEN_SIZE];
+            const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+            // 只在 split0 计算 pointwise，并把 gate 梯度作为全局缓存给其他 split 复用。
+            const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+            const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+            const float new_gate = tanhf(i_n + reset_gate * h_n);
+            const float grad_update = grad_out * (h_prev - new_gate);
+            const float grad_new = grad_out * (1.0f - update_gate);
+            const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+            const float grad_reset = grad_new_pre * h_n;
+            const float grad_recurrent_n = grad_new_pre * reset_gate;
+            const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+            const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+            grad_hidden_prev_direct = grad_out * update_gate;
+
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        grid.sync();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = min(split_begin + SPLIT_SIZE, GATES_SIZE);
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += grad_hidden_gates_steps[step_gates_start + gate_idx]
+                * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 15 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_sequence_cooperative_split32_state_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ hidden_gates_steps,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates_steps,
+    float* __restrict__ partial_sums,
+    float* __restrict__ grad_hidden_state,
+    int batch_size,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+    constexpr int SPLIT_COUNT = 32;
+    constexpr int SPLIT_SIZE = (GATES_SIZE + SPLIT_COUNT - 1) / SPLIT_COUNT;
+
+    extern __shared__ float shared_grad_gates[];
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 5;
+    const int split_idx = global_cta & (SPLIT_COUNT - 1);
+    const int hid = threadIdx.x;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+    const int partial_base = batch_idx * SPLIT_COUNT * HIDDEN_SIZE + hid;
+
+    for (int step = seq_len - 1; step >= 0; --step) {
+        float grad_hidden_acc = 0.0f;
+        if (step == seq_len - 1) {
+            grad_hidden_acc = grad_hidden_state[hidden_base];
+        } else {
+            grad_hidden_acc = partial_sums[partial_base]
+                + partial_sums[partial_base + HIDDEN_SIZE]
+                + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 15 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 16 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 17 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 18 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 19 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 20 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 21 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 22 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 23 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 24 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 25 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 26 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 27 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 28 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 29 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 30 * HIDDEN_SIZE]
+                + partial_sums[partial_base + 31 * HIDDEN_SIZE];
+        }
+
+        const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+        const int step_gates_base = (step * batch_size + batch_idx) * GATES_SIZE + hid;
+        const int output_base = (batch_idx * seq_len + step) * HIDDEN_SIZE + hid;
+
+        const float i_r = input_gates[input_base];
+        const float i_z = input_gates[input_base + HIDDEN_SIZE];
+        const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+        const float h_r = hidden_gates_steps[step_gates_base];
+        const float h_z = hidden_gates_steps[step_gates_base + HIDDEN_SIZE];
+        const float h_n = hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE];
+        const float h_prev = (step == 0)
+            ? h0[hidden_base]
+            : output[output_base - HIDDEN_SIZE];
+        const float grad_out = grad_hidden_acc + grad_output[output_base];
+
+        // split32 进一步扫描并行度上限，预期可能被重复 pointwise 和规约抵消。
+        const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+        const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+        const float new_gate = tanhf(i_n + reset_gate * h_n);
+        const float grad_update = grad_out * (h_prev - new_gate);
+        const float grad_new = grad_out * (1.0f - update_gate);
+        const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+        const float grad_reset = grad_new_pre * h_n;
+        const float grad_recurrent_n = grad_new_pre * reset_gate;
+        const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+        const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+        const float grad_hidden_prev_direct = grad_out * update_gate;
+
+        shared_grad_gates[hid] = grad_reset_pre;
+        shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+        shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+        if (split_idx == 0) {
+            grad_input_gates[input_base] = grad_reset_pre;
+            grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+            grad_hidden_gates_steps[step_gates_base] = grad_reset_pre;
+            grad_hidden_gates_steps[step_gates_base + HIDDEN_SIZE] = grad_update_pre;
+            grad_hidden_gates_steps[step_gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+        }
+        __syncthreads();
+
+        const int split_begin = split_idx * SPLIT_SIZE;
+        const int split_end = min(split_begin + SPLIT_SIZE, GATES_SIZE);
+
+        float partial = 0.0f;
+#pragma unroll 4
+        for (int gate_idx = split_begin; gate_idx < split_end; ++gate_idx) {
+            partial += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+        if (split_idx == 0) {
+            partial += grad_hidden_prev_direct;
+        }
+        partial_sums[partial_base + split_idx * HIDDEN_SIZE] = partial;
+        grid.sync();
+    }
+
+    if (split_idx == 0) {
+        grad_hidden_state[hidden_base] = partial_sums[partial_base]
+            + partial_sums[partial_base + HIDDEN_SIZE]
+            + partial_sums[partial_base + 2 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 3 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 4 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 5 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 6 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 7 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 8 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 9 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 10 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 11 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 12 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 13 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 14 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 15 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 16 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 17 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 18 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 19 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 20 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 21 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 22 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 23 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 24 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 25 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 26 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 27 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 28 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 29 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 30 * HIDDEN_SIZE]
+            + partial_sums[partial_base + 31 * HIDDEN_SIZE];
+    }
+}
+
+extern "C" __global__
+void a100_gru_h256_backward_step_recompute_kernel(
+    const float* __restrict__ grad_hidden_next,
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ output,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ grad_input_gates,
+    float* __restrict__ grad_hidden_gates,
+    float* __restrict__ grad_hidden_prev,
+    int batch_size,
+    int seq_len,
+    int step)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int GATES_SIZE = 3 * HIDDEN_SIZE;
+
+    extern __shared__ float shared[];
+    float* shared_hidden = shared;
+    float* shared_grad_gates = shared + HIDDEN_SIZE;
+
+    const int batch_idx = blockIdx.x;
+    const int hid = threadIdx.x;
+    if (batch_idx >= batch_size || hid >= HIDDEN_SIZE) {
+        return;
+    }
+
+    const int input_base = (batch_idx * seq_len + step) * GATES_SIZE + hid;
+    const int gates_base = batch_idx * GATES_SIZE + hid;
+    const int hidden_base = batch_idx * HIDDEN_SIZE + hid;
+
+    const float h_prev = (step == 0)
+        ? h0[hidden_base]
+        : output[(batch_idx * seq_len + step - 1) * HIDDEN_SIZE + hid];
+    shared_hidden[hid] = h_prev;
+    __syncthreads();
+
+    float h_r = bias_hh[hid];
+    float h_z = bias_hh[hid + HIDDEN_SIZE];
+    float h_n = bias_hh[hid + 2 * HIDDEN_SIZE];
+#pragma unroll 4
+    for (int k = 0; k < HIDDEN_SIZE; ++k) {
+        const float hidden_value = shared_hidden[k];
+        h_r += hidden_value * weight_hh[hid * HIDDEN_SIZE + k];
+        h_z += hidden_value * weight_hh[(hid + HIDDEN_SIZE) * HIDDEN_SIZE + k];
+        h_n += hidden_value * weight_hh[(hid + 2 * HIDDEN_SIZE) * HIDDEN_SIZE + k];
+    }
+
+    const float i_r = input_gates[input_base];
+    const float i_z = input_gates[input_base + HIDDEN_SIZE];
+    const float i_n = input_gates[input_base + 2 * HIDDEN_SIZE];
+    const float grad_out = grad_hidden_next[hidden_base];
+
+    const float reset_gate = 1.0f / (1.0f + expf(-(i_r + h_r)));
+    const float update_gate = 1.0f / (1.0f + expf(-(i_z + h_z)));
+    const float new_gate = tanhf(i_n + reset_gate * h_n);
+
+    // 显存节省实验：hidden gates 在本 kernel 内重算，不再保存整条序列。
+    const float grad_update = grad_out * (h_prev - new_gate);
+    const float grad_new = grad_out * (1.0f - update_gate);
+    const float grad_new_pre = grad_new * (1.0f - new_gate * new_gate);
+    const float grad_reset = grad_new_pre * h_n;
+    const float grad_recurrent_n = grad_new_pre * reset_gate;
+    const float grad_reset_pre = grad_reset * reset_gate * (1.0f - reset_gate);
+    const float grad_update_pre = grad_update * update_gate * (1.0f - update_gate);
+    const float grad_hidden_prev_direct = grad_out * update_gate;
+
+    shared_grad_gates[hid] = grad_reset_pre;
+    shared_grad_gates[hid + HIDDEN_SIZE] = grad_update_pre;
+    shared_grad_gates[hid + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+    grad_input_gates[input_base] = grad_reset_pre;
+    grad_input_gates[input_base + HIDDEN_SIZE] = grad_update_pre;
+    grad_input_gates[input_base + 2 * HIDDEN_SIZE] = grad_new_pre;
+    grad_hidden_gates[gates_base] = grad_reset_pre;
+    grad_hidden_gates[gates_base + HIDDEN_SIZE] = grad_update_pre;
+    grad_hidden_gates[gates_base + 2 * HIDDEN_SIZE] = grad_recurrent_n;
+
+    __syncthreads();
+
+    float acc = grad_hidden_prev_direct;
+#pragma unroll 3
+    for (int gate_block = 0; gate_block < GATES_SIZE; gate_block += HIDDEN_SIZE) {
+#pragma unroll 4
+        for (int k = 0; k < HIDDEN_SIZE; ++k) {
+            const int gate_idx = gate_block + k;
+            acc += shared_grad_gates[gate_idx] * weight_hh[gate_idx * HIDDEN_SIZE + hid];
+        }
+    }
+
+    grad_hidden_prev[hidden_base] = acc;
 }
 
 // 固定 hidden_size 版本用于断崖点附近的 A100 专用化实验。

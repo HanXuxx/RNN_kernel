@@ -89,11 +89,24 @@ PyTorch。
 6. cooperative groups/multi-CTA recurrent projection 已完成 h256 多版验证。
    h256 forward-only 已经快于 cuDNN：通用 cooperative4 为 `81.918 ms`，h256 专用
    shmem cooperative 为 `73.540 ms`，cuDNN 为 `111.976 ms`。
-7. 下一步聚焦 h256，不再把 h130/160/192 作为主 benchmark。优先继续压低 h256
-   forward 的 partial buffer/grid sync 开销，或开始 h256 backward 原型。
+7. 下一步聚焦 h256，不再把 h130/160/192 作为主 benchmark。h256 backward 正确性
+   原型和第一轮性能优化已完成，见 `docs/a100_h256_backward_study.md`。
 8. 初始阶段专门覆盖真实基准测试约束：单向 GRU、batch-first 输入、固定 dtype
    模式，以及 hidden size 大于 128。
-9. h256 forward 已经达到继续投入 backward 的门槛；实现 backward 后再整合优化器计时。
+9. h256 forward 已经达到继续投入 backward 的门槛；当前 pointwise CUDA backward、
+   跨 time step batched GEMM、fused backward step kernel、cooperative split
+   backward step、persistent backward sequence kernel、persistent-state kernel、
+   split16 persistent-state kernel、split16 persistent-state gate-cache kernel 和
+   split16 persistent-state gate-cache tiled kernel
+   已完成。seq8000 timed_steps=10 顺序复测下最佳自定义训练结果为
+   `137.471 ms/step`，快于同配置 cuDNN 复测的 `251.414 ms/step`，约 `1.83x`。
+   `recompute_hidden_gates`、tiled recurrent、外部分离 split recurrent partial-buffer、
+   split2 gate-cache、persistent-state-local、split32、split16 global-gates、
+   split32 gate-cache tiled、grad-coeff-cache tiled、gate-cache parallel-update forward、
+   gate-cache CTA8 forward 和 gate-cache CTA6 forward 路径都已验证为负向或中性实验；
+   split16 persistent-state gate-cache tiled 是当前正向候选，下一步应优化 CTA4 shmem
+   forward gate-cache kernel、backward split16 gate-cache tiled kernel、剩余 grid sync、
+   partial 规约和 reserve-space 显存/带宽成本。
 10. 与 cuDNN GRU 对比速度、显存和数值容差。
 11. 增加类似 CI 的本地检查：构建、单元测试、CPU 冒烟基准测试和 GPU 基准测试
    命令模板。

@@ -1,13 +1,17 @@
 """A100/SM80 specific GRU kernel prototypes."""
 
+from .gru_autograd import A100GRUH256, a100_gru_h256, copy_from_torch_gru
 from .gru_forward import (
     a100_gru_forward_from_gates,
     a100_gru_forward_from_gates_cooperative,
     a100_gru_forward_from_gates_cooperative_h256,
     a100_gru_forward_from_gates_cooperative_h256_cached_shmem,
+    a100_gru_forward_from_gates_cooperative_h256_cta8_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_parallel_update,
+    a100_gru_forward_from_gates_cooperative_h256_parallel_update_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_qwarp_shmem,
     a100_gru_forward_from_gates_cooperative_h256_shmem,
+    a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache,
     a100_gru_forward_from_gates_fused,
     a100_gru_forward_from_gates_fused_pingpong,
     a100_gru_forward_from_gates_fused_specialized,
@@ -27,13 +31,19 @@ from .gru_forward import (
 )
 
 __all__ = [
+    "A100GRUH256",
+    "a100_gru_h256",
+    "copy_from_torch_gru",
     "a100_gru_forward_from_gates",
     "a100_gru_forward_from_gates_cooperative",
     "a100_gru_forward_from_gates_cooperative_h256",
     "a100_gru_forward_from_gates_cooperative_h256_cached_shmem",
+    "a100_gru_forward_from_gates_cooperative_h256_cta8_shmem_gate_cache",
     "a100_gru_forward_from_gates_cooperative_h256_parallel_update",
+    "a100_gru_forward_from_gates_cooperative_h256_parallel_update_gate_cache",
     "a100_gru_forward_from_gates_cooperative_h256_qwarp_shmem",
     "a100_gru_forward_from_gates_cooperative_h256_shmem",
+    "a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache",
     "a100_gru_forward_from_gates_fused",
     "a100_gru_forward_from_gates_fused_pingpong",
     "a100_gru_forward_from_gates_fused_specialized",

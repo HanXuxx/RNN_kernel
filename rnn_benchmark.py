@@ -22,6 +22,14 @@ try:
 except ImportError:  # pragma: no cover - 允许不 source scripts/env.sh 时直接运行。
     from src.rnn_kernel.custom_gru import CustomGRU
 
+try:
+    from rnn_kernel.a100 import A100GRUH256
+except ImportError:  # pragma: no cover - 非 A100 环境允许不导入该实验实现。
+    try:
+        from src.rnn_kernel.a100 import A100GRUH256
+    except ImportError:
+        A100GRUH256 = None
+
 
 @dataclass
 class BenchmarkResult:
@@ -29,6 +37,7 @@ class BenchmarkResult:
     cell_type: str
     hidden_size: int
     sequence_chunk_len: int
+    a100_block_threads: int
     deterministic: bool
     cudnn_enabled: bool
     cudnn_benchmark: bool
@@ -59,6 +68,7 @@ class RNNBenchmarkModel(nn.Module):
         num_layers: int,
         sequence_chunk_len: int = 0,
         implementation: str = "torch",
+        a100_block_threads: int = 704,
     ):
         super().__init__()
         self.sequence_chunk_len = sequence_chunk_len
@@ -83,6 +93,145 @@ class RNNBenchmarkModel(nn.Module):
                 num_layers=num_layers,
                 pointwise_backend=pointwise_backend,
                 batch_first=True,
+            )
+        elif implementation in {
+            "a100_gru_h256",
+            "a100_gru_h256_recurrent_kernel",
+            "a100_gru_h256_recompute",
+            "a100_gru_h256_tiled_recurrent",
+            "a100_gru_h256_split_recurrent",
+            "a100_gru_h256_split4_recurrent",
+            "a100_gru_h256_coop_split4",
+            "a100_gru_h256_coop_split2",
+            "a100_gru_h256_coop_split2_cached",
+            "a100_gru_h256_coop_split2_specialized",
+            "a100_gru_h256_coop_split2_cached_local",
+            "a100_gru_h256_coop_split2_gate_cache",
+            "a100_gru_h256_coop_split2_persistent",
+            "a100_gru_h256_coop_split2_persistent_state",
+            "a100_gru_h256_coop_split2_persistent_state_local",
+            "a100_gru_h256_coop_split4_persistent_state",
+            "a100_gru_h256_coop_split8_persistent_state",
+            "a100_gru_h256_coop_split16_persistent_state",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+            "a100_gru_h256_coop_split16_persistent_state_grad_coeff_cache_tiled",
+            "a100_gru_h256_coop_split32_persistent_state_gate_cache_tiled",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_cta8",
+            "a100_gru_h256_coop_split16_persistent_state_global_gates",
+            "a100_gru_h256_coop_split32_persistent_state",
+        }:
+            if A100GRUH256 is None:
+                raise RuntimeError("a100_gru_h256 requires the rnn_kernel.a100 package.")
+            if cell_type != "GRU":
+                raise ValueError(f"{implementation} only supports GRU.")
+            if hidden_size != 256:
+                raise ValueError(f"{implementation} only supports hidden_size=256.")
+            if num_layers != 1:
+                raise ValueError(f"{implementation} only supports num_layers=1.")
+            self.rnn = A100GRUH256(
+                input_size=input_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                block_threads=a100_block_threads,
+                use_recurrent_backward_kernel=(
+                    implementation == "a100_gru_h256_recurrent_kernel"
+                ),
+                recompute_hidden_gates=(implementation == "a100_gru_h256_recompute"),
+                use_tiled_recurrent_backward_kernel=(
+                    implementation == "a100_gru_h256_tiled_recurrent"
+                ),
+                use_split_recurrent_backward_kernel=(
+                    implementation
+                    in {"a100_gru_h256_split_recurrent", "a100_gru_h256_split4_recurrent"}
+                ),
+                split_recurrent_count=(
+                    4 if implementation == "a100_gru_h256_split4_recurrent" else 8
+                ),
+                use_cooperative_split_backward_kernel=(
+                    implementation in {"a100_gru_h256_coop_split4", "a100_gru_h256_coop_split2"}
+                ),
+                cooperative_split_count=(
+                    2
+                    if implementation
+                    in {"a100_gru_h256_coop_split2", "a100_gru_h256_coop_split2_cached"}
+                    else 4
+                ),
+                use_cooperative_split_cached_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_cached"
+                ),
+                use_cooperative_split2_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_specialized"
+                ),
+                use_cooperative_split2_cached_local_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_cached_local"
+                ),
+                use_gate_cache_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_gate_cache"
+                ),
+                use_persistent_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_persistent"
+                ),
+                use_persistent_state_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_persistent_state"
+                ),
+                use_persistent_state_local_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split2_persistent_state_local"
+                ),
+                use_persistent_state4_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split4_persistent_state"
+                ),
+                use_persistent_state8_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split8_persistent_state"
+                ),
+                use_persistent_state16_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split16_persistent_state"
+                ),
+                use_persistent_state16_gate_cache_backward_kernel=(
+                    implementation
+                    in {
+                        "a100_gru_h256_coop_split16_persistent_state_gate_cache",
+                        "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update",
+                        "a100_gru_h256_coop_split16_persistent_state_gate_cache_cta8",
+                    }
+                ),
+                use_persistent_state16_gate_cache_tiled_backward_kernel=(
+                    implementation
+                    in {
+                        "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
+                        "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+                    }
+                ),
+                use_persistent_state16_grad_coeff_cache_tiled_backward_kernel=(
+                    implementation
+                    == "a100_gru_h256_coop_split16_persistent_state_grad_coeff_cache_tiled"
+                ),
+                use_persistent_state32_gate_cache_tiled_backward_kernel=(
+                    implementation
+                    == "a100_gru_h256_coop_split32_persistent_state_gate_cache_tiled"
+                ),
+                use_gate_cache_parallel_update_forward_kernel=(
+                    implementation
+                    == "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update"
+                ),
+                use_gate_cache_cta8_forward_kernel=(
+                    implementation
+                    == "a100_gru_h256_coop_split16_persistent_state_gate_cache_cta8"
+                ),
+                use_gate_cache_cta6_forward_kernel=(
+                    implementation
+                    == "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6"
+                ),
+                use_persistent_state16_global_gates_backward_kernel=(
+                    implementation
+                    == "a100_gru_h256_coop_split16_persistent_state_global_gates"
+                ),
+                use_persistent_state32_backward_kernel=(
+                    implementation == "a100_gru_h256_coop_split32_persistent_state"
+                ),
             )
         else:
             raise ValueError(f"Unsupported implementation: {implementation}")
@@ -285,6 +434,7 @@ def run_case(
         num_layers=args.num_layers,
         sequence_chunk_len=args.sequence_chunk_len,
         implementation=args.implementation,
+        a100_block_threads=args.a100_block_threads,
     ).to(device)
     if (
         args.implementation == "torch"
@@ -338,6 +488,7 @@ def run_case(
             cell_type=cell_type,
             hidden_size=hidden_size,
             sequence_chunk_len=args.sequence_chunk_len,
+            a100_block_threads=args.a100_block_threads,
             deterministic=args.deterministic,
             cudnn_enabled=torch.backends.cudnn.enabled,
             cudnn_benchmark=torch.backends.cudnn.benchmark,
@@ -380,6 +531,7 @@ def run_case(
             cell_type=cell_type,
             hidden_size=hidden_size,
             sequence_chunk_len=args.sequence_chunk_len,
+            a100_block_threads=args.a100_block_threads,
             deterministic=args.deterministic,
             cudnn_enabled=torch.backends.cudnn.enabled,
             cudnn_benchmark=torch.backends.cudnn.benchmark,
@@ -451,6 +603,7 @@ def write_csv(path: str, results: Iterable[BenchmarkResult]) -> None:
         "implementation",
         "hidden_size",
         "sequence_chunk_len",
+        "a100_block_threads",
         "deterministic",
         "cudnn_enabled",
         "cudnn_benchmark",
@@ -482,17 +635,54 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Minimal GRU/LSTM hidden_size training-speed benchmark."
     )
-    parser.add_argument("--hidden-sizes", type=parse_int_list, default=parse_int_list("64,96,128,130,160,192,256"))
+    parser.add_argument("--hidden-sizes", type=parse_int_list, default=parse_int_list("256"))
     parser.add_argument("--cell-types", type=parse_cell_types, default=parse_cell_types("GRU,LSTM"))
     parser.add_argument(
         "--implementation",
-        choices=["torch", "custom_gru", "custom_gru_triton"],
+        choices=[
+            "torch",
+            "custom_gru",
+            "custom_gru_triton",
+            "a100_gru_h256",
+            "a100_gru_h256_recurrent_kernel",
+            "a100_gru_h256_recompute",
+            "a100_gru_h256_tiled_recurrent",
+            "a100_gru_h256_split_recurrent",
+            "a100_gru_h256_split4_recurrent",
+            "a100_gru_h256_coop_split4",
+            "a100_gru_h256_coop_split2",
+            "a100_gru_h256_coop_split2_cached",
+            "a100_gru_h256_coop_split2_specialized",
+            "a100_gru_h256_coop_split2_cached_local",
+            "a100_gru_h256_coop_split2_gate_cache",
+            "a100_gru_h256_coop_split2_persistent",
+            "a100_gru_h256_coop_split2_persistent_state",
+            "a100_gru_h256_coop_split2_persistent_state_local",
+            "a100_gru_h256_coop_split4_persistent_state",
+            "a100_gru_h256_coop_split8_persistent_state",
+            "a100_gru_h256_coop_split16_persistent_state",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+            "a100_gru_h256_coop_split16_persistent_state_grad_coeff_cache_tiled",
+            "a100_gru_h256_coop_split32_persistent_state_gate_cache_tiled",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_cta8",
+            "a100_gru_h256_coop_split16_persistent_state_global_gates",
+            "a100_gru_h256_coop_split32_persistent_state",
+        ],
         default="torch",
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=8000)
     parser.add_argument("--input-dim", type=int, default=9)
     parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument(
+        "--a100-block-threads",
+        type=int,
+        default=704,
+        help="Thread count for A100 h256 forward cooperative kernels.",
+    )
     parser.add_argument(
         "--sequence-chunk-len",
         type=int,
@@ -556,6 +746,7 @@ def main() -> None:
     print(
         f"batch_size={args.batch_size}, seq_len={args.seq_len}, input_dim={args.input_dim}, "
         f"num_layers={args.num_layers}, sequence_chunk_len={args.sequence_chunk_len}, "
+        f"a100_block_threads={args.a100_block_threads}, "
         f"dataset_batches={args.dataset_batches}, "
         f"warmup_steps={args.warmup_steps}, timed_steps={args.timed_steps}, "
         f"deterministic={args.deterministic}, breakdown_timing={args.breakdown_timing}, "

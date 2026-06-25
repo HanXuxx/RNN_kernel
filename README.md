@@ -20,6 +20,8 @@ source scripts/env.sh
 - Python 3.12
 - PyTorch 2.6.0，CUDA 12.4 运行时包
 - Triton 3.2.0
+- cuda-python 12.4.0 和 `.venv` 内 CUDA NVRTC/NVCC 辅助 wheel
+- 项目本地 Nsight CLI，使用 `source scripts/env_nsight.sh` 加载
 - pytest、pandas、matplotlib、ninja
 
 当前机器是 A100 GPU，NVIDIA 驱动版本为 `550.163.01`，支持 CUDA 12.4。
@@ -56,6 +58,13 @@ python rnn_benchmark.py \
   --output-csv results/rnn_baseline.csv
 ```
 
+A100 上的 Nsight Systems 调度采集：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_nsight_a100_forward.sh
+```
+
 ## 目录结构
 
 - `rnn_benchmark.py`：当前最小化的 GRU/LSTM 训练基准测试。
@@ -72,3 +81,8 @@ python rnn_benchmark.py \
 
 当前 A100 第一轮闭环研究结论见 `docs/a100_baseline_study.md`。
 不降精度的 fp32-only 方法研究见 `docs/a100_fp32_method_study.md`。
+自定义 GRU kernel/backward 可行性研究见 `docs/custom_gru_kernel_study.md`。
+Triton forward-only time-loop 原型研究见 `docs/triton_forward_kernel_study.md`。
+CUDA C/NVRTC forward-only 原型研究见 `docs/cuda_forward_kernel_study.md`。
+A100/SM80 专用 forward-only 原型和 Nsight 调度研究见
+`docs/a100_forward_kernel_study.md`。

@@ -61,8 +61,11 @@ cuDNN 当前行为。
 ## 阶段 4：Triton 原型
 
 1. 先用 Triton 原型化独立的 GRU gate pointwise 操作。
-2. 只在小型受控形状上先和 PyTorch 对比基准测试。
-3. 在前向和梯度测试稳定前，不尝试完整替换训练实现。
+2. 当前 Triton pointwise forward/backward 研究见
+   `docs/custom_gru_kernel_study.md`。该路线正确但远慢于 cuDNN，不能作为主优化
+   方向。
+3. 单层 forward-only time-loop 原型见 `docs/triton_forward_kernel_study.md`。该
+   路线正确，但由于缺少高效矩阵乘，仍比 cuDNN forward 慢，不建议直接补 backward。
 4. 在投入 CUDA extension 前，主要用 Triton 验证数据布局、融合机会，以及
    H200/A100 的敏感性。
 
@@ -71,13 +74,28 @@ PyTorch。
 
 ## 阶段 5：CUDA/C++ 扩展
 
-1. 在 `src/rnn_kernel/csrc/` 下添加 PyTorch extension，构建目标包含 SM80 和
-   SM90。
-2. 初始阶段专门覆盖真实基准测试约束：单向 GRU、batch-first 输入、固定 dtype
+1. 当前机器没有检测到系统 `nvcc`，但已打通 `.venv` 内 CUDA C/NVRTC 原型，见
+   `docs/cuda_forward_kernel_study.md`。
+2. 初始 NVRTC forward-only 原型正确，但由于 hidden projection 是朴素 per-batch
+   matvec，目标形状上仍慢于 cuDNN，不建议直接补 backward。
+3. 下一版 CUDA 路线必须引入高效矩阵乘组织：CUTLASS、tiled GEMM、warp-level MMA
+   或 PyTorch extension 中可维护的等价实现。
+4. A100/SM80 专用 forward-only 原型见 `docs/a100_forward_kernel_study.md`。该路线
+   已用 Nsight Systems 验证调度形状：自定义 recurrent kernel 是主要瓶颈，单纯匹配
+   cuDNN 的 block size 不能追上 cuDNN。当前主目标已收敛到 `hidden_size=256`。
+5. 当前机器没有开放 GPU performance counter 权限，Nsight Compute 会报
+   `ERR_NVGPUCTRPERM`。如果要继续做 occupancy、warp stall、memory throughput 层面的
+   定量优化，需要管理员开放 counter 权限，或在允许 profiling 的机器上运行。
+6. cooperative groups/multi-CTA recurrent projection 已完成 h256 多版验证。
+   h256 forward-only 已经快于 cuDNN：通用 cooperative4 为 `81.918 ms`，h256 专用
+   shmem cooperative 为 `73.540 ms`，cuDNN 为 `111.976 ms`。
+7. 下一步聚焦 h256，不再把 h130/160/192 作为主 benchmark。优先继续压低 h256
+   forward 的 partial buffer/grid sync 开销，或开始 h256 backward 原型。
+8. 初始阶段专门覆盖真实基准测试约束：单向 GRU、batch-first 输入、固定 dtype
    模式，以及 hidden size 大于 128。
-3. 先实现前向，再实现反向，最后整合优化器计时。
-4. 与 cuDNN GRU 对比速度、显存和数值容差。
-5. 增加类似 CI 的本地检查：构建、单元测试、CPU 冒烟基准测试和 GPU 基准测试
+9. h256 forward 已经达到继续投入 backward 的门槛；实现 backward 后再整合优化器计时。
+10. 与 cuDNN GRU 对比速度、显存和数值容差。
+11. 增加类似 CI 的本地检查：构建、单元测试、CPU 冒烟基准测试和 GPU 基准测试
    命令模板。
 
 退出标准：候选 kernel 在 A100 和 H200 的目标工作负载上都正确，并且快于

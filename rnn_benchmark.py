@@ -17,9 +17,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from rnn_kernel.custom_gru import CustomGRU
+except ImportError:  # pragma: no cover - 允许不 source scripts/env.sh 时直接运行。
+    from src.rnn_kernel.custom_gru import CustomGRU
+
 
 @dataclass
 class BenchmarkResult:
+    implementation: str
     cell_type: str
     hidden_size: int
     sequence_chunk_len: int
@@ -52,18 +58,34 @@ class RNNBenchmarkModel(nn.Module):
         hidden_size: int,
         num_layers: int,
         sequence_chunk_len: int = 0,
+        implementation: str = "torch",
     ):
         super().__init__()
         self.sequence_chunk_len = sequence_chunk_len
-        rnn_cls = {"GRU": nn.GRU, "LSTM": nn.LSTM}[cell_type]
-        self.rnn = rnn_cls(
-            input_size=input_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=0.0,
-            bidirectional=False,
-            batch_first=True,
-        )
+        self.implementation = implementation
+        if implementation == "torch":
+            rnn_cls = {"GRU": nn.GRU, "LSTM": nn.LSTM}[cell_type]
+            self.rnn = rnn_cls(
+                input_size=input_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=0.0,
+                bidirectional=False,
+                batch_first=True,
+            )
+        elif implementation in {"custom_gru", "custom_gru_triton"}:
+            if cell_type != "GRU":
+                raise ValueError("custom_gru implementations only support GRU.")
+            pointwise_backend = "triton" if implementation == "custom_gru_triton" else "torch"
+            self.rnn = CustomGRU(
+                input_size=input_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                pointwise_backend=pointwise_backend,
+                batch_first=True,
+            )
+        else:
+            raise ValueError(f"Unsupported implementation: {implementation}")
         self.head = nn.Linear(hidden_size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -262,8 +284,13 @@ def run_case(
         hidden_size=hidden_size,
         num_layers=args.num_layers,
         sequence_chunk_len=args.sequence_chunk_len,
+        implementation=args.implementation,
     ).to(device)
-    if device.type == "cuda" and torch.backends.cudnn.enabled:
+    if (
+        args.implementation == "torch"
+        and device.type == "cuda"
+        and torch.backends.cudnn.enabled
+    ):
         model.rnn.flatten_parameters()
     params = count_parameters(model)
     if args.compile_model:
@@ -307,6 +334,7 @@ def run_case(
             else None
         )
         return BenchmarkResult(
+            implementation=args.implementation,
             cell_type=cell_type,
             hidden_size=hidden_size,
             sequence_chunk_len=args.sequence_chunk_len,
@@ -348,6 +376,7 @@ def run_case(
         if "out of memory" not in str(e).lower():
             raise
         return BenchmarkResult(
+            implementation=args.implementation,
             cell_type=cell_type,
             hidden_size=hidden_size,
             sequence_chunk_len=args.sequence_chunk_len,
@@ -419,6 +448,7 @@ def print_result(result: BenchmarkResult) -> None:
 def write_csv(path: str, results: Iterable[BenchmarkResult]) -> None:
     fields = [
         "cell_type",
+        "implementation",
         "hidden_size",
         "sequence_chunk_len",
         "deterministic",
@@ -454,6 +484,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hidden-sizes", type=parse_int_list, default=parse_int_list("64,96,128,130,160,192,256"))
     parser.add_argument("--cell-types", type=parse_cell_types, default=parse_cell_types("GRU,LSTM"))
+    parser.add_argument(
+        "--implementation",
+        choices=["torch", "custom_gru", "custom_gru_triton"],
+        default="torch",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=8000)
     parser.add_argument("--input-dim", type=int, default=9)
@@ -505,6 +540,7 @@ def main() -> None:
     configure_backends(args, device)
 
     print("RNN hidden_size benchmark")
+    print(f"implementation={args.implementation}")
     print(f"torch={torch.__version__}")
     if device.type == "cuda":
         print(f"cuda={torch.version.cuda}")

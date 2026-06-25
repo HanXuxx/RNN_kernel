@@ -1,7 +1,8 @@
 -r requirements.txt
 
+cuda-python==12.4.0
 matplotlib==3.11.0
 ninja==1.13.0
+nvidia-cuda-nvcc-cu12==12.4.131
 pandas==3.0.3
 pytest==9.1.1
-

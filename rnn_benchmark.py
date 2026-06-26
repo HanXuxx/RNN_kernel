@@ -31,6 +31,84 @@ except ImportError:  # pragma: no cover - 非 A100 环境允许不导入该实�
         A100GRUH256 = None
 
 
+_A100_HTILE2_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile2"
+)
+_A100_HTILE4_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4"
+)
+_A100_HTILE4_COMPACT_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4_compact"
+)
+_A100_HTILE4_COMPACT_HOIST_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4_compact_hoist"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4_compact_hoist_row4"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row4"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split12_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT24_SPLIT0_KEEP_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split24_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_htile4_compact_hoist_row4"
+)
+_A100_HTILE4_COMPACT_HOIST_QWARP_WEIGHT_SHMEM_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_qwarp"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW3_WEIGHT_SHMEM_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row3"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_HIDDEN_SHMEM_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row4_forward_hidden_shmem"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_WEIGHT_SHMEM_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row4_forward_weight_shmem"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split8_persistent_state_gate_cache_tiled_htile4_compact_hoist_row4"
+)
+_A100_HTILE8_COMPACT_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile8_compact"
+)
+
+
+def resolve_a100_block_threads(implementation: str, a100_block_threads: int) -> int:
+    """根据实现选择 A100 h256 cooperative kernel 的默认 block size。"""
+    if a100_block_threads > 0:
+        return a100_block_threads
+    if implementation == _A100_HTILE2_IMPLEMENTATION:
+        return 512
+    if implementation in {
+        _A100_HTILE4_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT24_SPLIT0_KEEP_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_QWARP_WEIGHT_SHMEM_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW3_WEIGHT_SHMEM_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_HIDDEN_SHMEM_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_WEIGHT_SHMEM_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION,
+    }:
+        return 256
+    if implementation == _A100_HTILE8_COMPACT_IMPLEMENTATION:
+        return 128
+    return 704
+
+
 @dataclass
 class BenchmarkResult:
     implementation: str
@@ -68,11 +146,15 @@ class RNNBenchmarkModel(nn.Module):
         num_layers: int,
         sequence_chunk_len: int = 0,
         implementation: str = "torch",
-        a100_block_threads: int = 704,
+        a100_block_threads: int = 0,
     ):
         super().__init__()
         self.sequence_chunk_len = sequence_chunk_len
         self.implementation = implementation
+        effective_a100_block_threads = resolve_a100_block_threads(
+            implementation,
+            a100_block_threads,
+        )
         if implementation == "torch":
             rnn_cls = {"GRU": nn.GRU, "LSTM": nn.LSTM}[cell_type]
             self.rnn = rnn_cls(
@@ -116,6 +198,22 @@ class RNNBenchmarkModel(nn.Module):
             "a100_gru_h256_coop_split16_persistent_state_gate_cache",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+            _A100_HTILE2_IMPLEMENTATION,
+            _A100_HTILE4_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT24_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_QWARP_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW3_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_HIDDEN_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION,
+            _A100_HTILE8_COMPACT_IMPLEMENTATION,
             "a100_gru_h256_coop_split16_persistent_state_grad_coeff_cache_tiled",
             "a100_gru_h256_coop_split32_persistent_state_gate_cache_tiled",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update",
@@ -136,7 +234,7 @@ class RNNBenchmarkModel(nn.Module):
                 hidden_size=hidden_size,
                 num_layers=num_layers,
                 batch_first=True,
-                block_threads=a100_block_threads,
+                block_threads=effective_a100_block_threads,
                 use_recurrent_backward_kernel=(
                     implementation == "a100_gru_h256_recurrent_kernel"
                 ),
@@ -198,11 +296,46 @@ class RNNBenchmarkModel(nn.Module):
                         "a100_gru_h256_coop_split16_persistent_state_gate_cache_cta8",
                     }
                 ),
+                use_persistent_state8_gate_cache_tiled_backward_kernel=(
+                    implementation == _A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION
+                ),
+                use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel=(
+                    implementation
+                    in {
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_QWARP_WEIGHT_SHMEM_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW3_WEIGHT_SHMEM_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_HIDDEN_SHMEM_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_WEIGHT_SHMEM_IMPLEMENTATION,
+                    }
+                ),
+                use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION
+                ),
+                use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION
+                ),
+                use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT24_SPLIT0_KEEP_IMPLEMENTATION
+                ),
+                use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION
+                ),
                 use_persistent_state16_gate_cache_tiled_backward_kernel=(
                     implementation
                     in {
                         "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
                         "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+                        _A100_HTILE2_IMPLEMENTATION,
+                        _A100_HTILE4_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_IMPLEMENTATION,
+                        _A100_HTILE8_COMPACT_IMPLEMENTATION,
                     }
                 ),
                 use_persistent_state16_grad_coeff_cache_tiled_backward_kernel=(
@@ -224,6 +357,47 @@ class RNNBenchmarkModel(nn.Module):
                 use_gate_cache_cta6_forward_kernel=(
                     implementation
                     == "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6"
+                ),
+                use_gate_cache_htile2_forward_kernel=(
+                    implementation == _A100_HTILE2_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_forward_kernel=(
+                    implementation == _A100_HTILE4_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_compact_forward_kernel=(
+                    implementation == _A100_HTILE4_COMPACT_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_compact_hoist_forward_kernel=(
+                    implementation == _A100_HTILE4_COMPACT_HOIST_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel=(
+                    implementation == _A100_HTILE4_COMPACT_HOIST_QWARP_WEIGHT_SHMEM_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_compact_hoist_row3_forward_kernel=(
+                    implementation == _A100_HTILE4_COMPACT_HOIST_ROW3_WEIGHT_SHMEM_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_compact_hoist_row4_forward_kernel=(
+                    implementation
+                    in {
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT24_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION,
+                    }
+                ),
+                use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_HIDDEN_SHMEM_IMPLEMENTATION
+                ),
+                use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_WEIGHT_SHMEM_IMPLEMENTATION
+                ),
+                use_gate_cache_htile8_compact_forward_kernel=(
+                    implementation == _A100_HTILE8_COMPACT_IMPLEMENTATION
                 ),
                 use_persistent_state16_global_gates_backward_kernel=(
                     implementation
@@ -664,6 +838,22 @@ def parse_args() -> argparse.Namespace:
             "a100_gru_h256_coop_split16_persistent_state_gate_cache",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+            _A100_HTILE2_IMPLEMENTATION,
+            _A100_HTILE4_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT24_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_QWARP_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW3_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_HIDDEN_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_FORWARD_WEIGHT_SHMEM_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION,
+            _A100_HTILE8_COMPACT_IMPLEMENTATION,
             "a100_gru_h256_coop_split16_persistent_state_grad_coeff_cache_tiled",
             "a100_gru_h256_coop_split32_persistent_state_gate_cache_tiled",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update",
@@ -680,8 +870,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--a100-block-threads",
         type=int,
-        default=704,
-        help="Thread count for A100 h256 forward cooperative kernels.",
+        default=0,
+        help=(
+            "Thread count for A100 h256 forward cooperative kernels. "
+            "0 selects the implementation default."
+        ),
     )
     parser.add_argument(
         "--sequence-chunk-len",
@@ -720,6 +913,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.a100_block_threads = resolve_a100_block_threads(
+        args.implementation,
+        args.a100_block_threads,
+    )
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 

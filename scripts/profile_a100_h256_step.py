@@ -5,7 +5,7 @@ import time
 
 import torch
 
-from rnn_benchmark import RNNBenchmarkModel
+from rnn_benchmark import RNNBenchmarkModel, resolve_a100_block_threads
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +34,22 @@ def parse_args() -> argparse.Namespace:
             "a100_gru_h256_coop_split16_persistent_state_gate_cache",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_cta6",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile2",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4_compact",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4_compact_hoist",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split12_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split24_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_qwarp",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row3",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row4_forward_hidden_shmem",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_weight_shmem_htile4_compact_hoist_row4_forward_weight_shmem",
+            "a100_gru_h256_coop_split8_persistent_state_gate_cache_tiled_htile4_compact_hoist_row4",
+            "a100_gru_h256_coop_split16_persistent_state_gate_cache_tiled_htile8_compact",
             "a100_gru_h256_coop_split16_persistent_state_grad_coeff_cache_tiled",
             "a100_gru_h256_coop_split32_persistent_state_gate_cache_tiled",
             "a100_gru_h256_coop_split16_persistent_state_gate_cache_parallel_update",
@@ -46,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--input-dim", type=int, default=9)
+    parser.add_argument("--a100-block-threads", type=int, default=0)
     parser.add_argument("--warmup-steps", type=int, default=2)
     return parser.parse_args()
 
@@ -71,6 +88,10 @@ def run_step(
 
 def main() -> None:
     args = parse_args()
+    args.a100_block_threads = resolve_a100_block_threads(
+        args.implementation,
+        args.a100_block_threads,
+    )
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(2071)
@@ -82,6 +103,7 @@ def main() -> None:
         hidden_size=256,
         num_layers=1,
         implementation=args.implementation,
+        a100_block_threads=args.a100_block_threads,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     x = torch.randn(args.batch_size, args.seq_len, args.input_dim, device=device)

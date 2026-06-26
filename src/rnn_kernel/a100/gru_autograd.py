@@ -13,6 +13,16 @@ from .gru_forward import (
     _get_a100_kernel,
     a100_gru_forward_from_gates_cooperative_h256_cta8_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_cta6_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile2_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_qwarp_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row3_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_hidden_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_weight_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile8_compact_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_parallel_update_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_shmem,
     a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache,
@@ -1427,6 +1437,577 @@ def _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled(
     return grad_hidden_state
 
 
+def _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split16 weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split16 weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 16, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 16, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 48 + 48 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # 该分支每个 block 需要约 49KB 动态 shared memory，需要显式打开 opt-in 上限。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 16,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
+def _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_split0_keep(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split16 split0-keep weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split16 split0-keep weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 16, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 16, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_split0_keep_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 48 + 48 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # 该实验分支沿用 weight-shmem 的 49KB 动态 shared memory 配置。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 16,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
+def _a100_gru_h256_backward_sequence_cooperative_split12_gate_cache_state_tiled_weight_shmem_split0_keep(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split12 split0-keep weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split12 split0-keep weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 12, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 12, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split12_gate_cache_state_tiled_weight_shmem_split0_keep_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 64 + 64 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # split12 每个 split 缓存 64x256 recurrent weight tile，约 65.8KB 动态 shared memory。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 12,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
+def _a100_gru_h256_backward_sequence_cooperative_split24_gate_cache_state_tiled_weight_shmem_split0_keep(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split24 split0-keep weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split24 split0-keep weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 24, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 24, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split24_gate_cache_state_tiled_weight_shmem_split0_keep_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 32 + 32 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # split24 每个 split 缓存 32x256 recurrent weight tile，减少 shared memory 压力。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 24,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
+def _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_split0_keep_own_shmem(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split16 split0-keep own-shmem weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split16 split0-keep own-shmem weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 16, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 16, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_split0_keep_own_shmem_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 48 + hidden_size + 48 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # 本分支额外用 256 个 float shared memory 保存本 split 上一轮 partial。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 16,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
+def _a100_gru_h256_backward_sequence_cooperative_split8_gate_cache_state_tiled(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split8 tiled gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split8 tiled gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 8, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 8, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_bytes = 96 * ctypes.sizeof(ctypes.c_float)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        compiled.h256_backward_sequence_cooperative_split8_gate_cache_state_tiled_function,
+        batch_size * 8,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
 def _a100_gru_h256_backward_sequence_cooperative_split32_gate_cache_state_tiled(
     grad_output: torch.Tensor,
     grad_hidden_state: torch.Tensor,
@@ -1851,12 +2432,28 @@ class A100GRUH256Function(torch.autograd.Function):
         use_persistent_state8_backward_kernel: bool = False,
         use_persistent_state16_backward_kernel: bool = False,
         use_persistent_state16_gate_cache_backward_kernel: bool = False,
+        use_persistent_state8_gate_cache_tiled_backward_kernel: bool = False,
         use_persistent_state16_gate_cache_tiled_backward_kernel: bool = False,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel: bool = False,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel: bool = False,
         use_persistent_state16_grad_coeff_cache_tiled_backward_kernel: bool = False,
         use_persistent_state32_gate_cache_tiled_backward_kernel: bool = False,
         use_gate_cache_parallel_update_forward_kernel: bool = False,
         use_gate_cache_cta8_forward_kernel: bool = False,
         use_gate_cache_cta6_forward_kernel: bool = False,
+        use_gate_cache_htile2_forward_kernel: bool = False,
+        use_gate_cache_htile4_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row3_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel: bool = False,
+        use_gate_cache_htile8_compact_forward_kernel: bool = False,
         use_persistent_state16_global_gates_backward_kernel: bool = False,
         use_persistent_state32_backward_kernel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1891,6 +2488,14 @@ class A100GRUH256Function(torch.autograd.Function):
         if bias_hh.shape != (3 * hidden_size,):
             raise ValueError("bias_hh must have shape [3 * hidden].")
 
+        use_persistent_state16_weight_shmem_family_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel
+            or use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel
+        )
+
         input_gates = F.linear(
             x.reshape(batch_size * seq_len, input_size),
             weight_ih,
@@ -1899,7 +2504,9 @@ class A100GRUH256Function(torch.autograd.Function):
         if (
             (
                 use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
                 or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
                 or use_persistent_state32_gate_cache_tiled_backward_kernel
             )
             and use_gate_cache_parallel_update_forward_kernel
@@ -1916,7 +2523,9 @@ class A100GRUH256Function(torch.autograd.Function):
         elif (
             (
                 use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
                 or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
                 or use_persistent_state32_gate_cache_tiled_backward_kernel
             )
             and use_gate_cache_cta8_forward_kernel
@@ -1931,12 +2540,184 @@ class A100GRUH256Function(torch.autograd.Function):
         elif (
             (
                 use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
                 or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
                 or use_persistent_state32_gate_cache_tiled_backward_kernel
             )
             and use_gate_cache_cta6_forward_kernel
         ):
             output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_cta6_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile2_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile2_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_row4_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_qwarp_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_row3_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row3_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_hidden_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_weight_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile8_compact_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile8_compact_shmem_gate_cache(
                 input_gates,
                 h0,
                 weight_hh,
@@ -1956,7 +2737,9 @@ class A100GRUH256Function(torch.autograd.Function):
         elif (
             use_gate_cache_backward_kernel
             or use_persistent_state16_gate_cache_backward_kernel
+            or use_persistent_state8_gate_cache_tiled_backward_kernel
             or use_persistent_state16_gate_cache_tiled_backward_kernel
+            or use_persistent_state16_weight_shmem_family_backward_kernel
             or use_persistent_state32_gate_cache_tiled_backward_kernel
         ):
             output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache(
@@ -2014,8 +2797,26 @@ class A100GRUH256Function(torch.autograd.Function):
         ctx.use_persistent_state16_gate_cache_backward_kernel = (
             use_persistent_state16_gate_cache_backward_kernel
         )
+        ctx.use_persistent_state8_gate_cache_tiled_backward_kernel = (
+            use_persistent_state8_gate_cache_tiled_backward_kernel
+        )
         ctx.use_persistent_state16_gate_cache_tiled_backward_kernel = (
             use_persistent_state16_gate_cache_tiled_backward_kernel
+        )
+        ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel
+        )
+        ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
+        ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
+        ctx.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
+        ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel
         )
         ctx.use_persistent_state16_grad_coeff_cache_tiled_backward_kernel = (
             use_persistent_state16_grad_coeff_cache_tiled_backward_kernel
@@ -2051,7 +2852,13 @@ class A100GRUH256Function(torch.autograd.Function):
             ctx.recompute_hidden_gates
             or ctx.use_gate_cache_backward_kernel
             or ctx.use_persistent_state16_gate_cache_backward_kernel
+            or ctx.use_persistent_state8_gate_cache_tiled_backward_kernel
             or ctx.use_persistent_state16_gate_cache_tiled_backward_kernel
+            or ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel
+            or ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or ctx.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel
             or ctx.use_persistent_state16_grad_coeff_cache_tiled_backward_kernel
             or ctx.use_persistent_state32_gate_cache_tiled_backward_kernel
         ):
@@ -2155,9 +2962,39 @@ class A100GRUH256Function(torch.autograd.Function):
             if ctx.use_persistent_state16_gate_cache_backward_kernel
             else None
         )
+        persistent_state8_gate_cache_tiled_partial_sums = (
+            torch.empty(batch_size, 8, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state8_gate_cache_tiled_backward_kernel
+            else None
+        )
         persistent_state16_gate_cache_tiled_partial_sums = (
             torch.empty(batch_size, 16, hidden_size, device=x.device, dtype=x.dtype)
             if ctx.use_persistent_state16_gate_cache_tiled_backward_kernel
+            else None
+        )
+        persistent_state16_gate_cache_tiled_weight_shmem_partial_sums = (
+            torch.empty(batch_size, 16, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel
+            else None
+        )
+        persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_partial_sums = (
+            torch.empty(batch_size, 16, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            else None
+        )
+        persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_partial_sums = (
+            torch.empty(batch_size, 12, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            else None
+        )
+        persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_partial_sums = (
+            torch.empty(batch_size, 24, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            else None
+        )
+        persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_partial_sums = (
+            torch.empty(batch_size, 16, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel
             else None
         )
         persistent_state16_grad_coeff_cache_tiled_partial_sums = (
@@ -2210,6 +3047,102 @@ class A100GRUH256Function(torch.autograd.Function):
                     grad_input_gates,
                     grad_hidden_gates_steps,
                     persistent_state32_gate_cache_tiled_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state8_gate_cache_tiled_backward_kernel:
+            assert persistent_state8_gate_cache_tiled_partial_sums is not None
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split8_gate_cache_state_tiled(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state8_gate_cache_tiled_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel:
+            assert (
+                persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_partial_sums
+                is not None
+            )
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_split0_keep(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel:
+            assert persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_partial_sums is not None
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split12_gate_cache_state_tiled_weight_shmem_split0_keep(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel:
+            assert persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_partial_sums is not None
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split24_gate_cache_state_tiled_weight_shmem_split0_keep(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel:
+            assert (
+                persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_partial_sums
+                is not None
+            )
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem_split0_keep_own_shmem(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel:
+            assert persistent_state16_gate_cache_tiled_weight_shmem_partial_sums is not None
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split16_gate_cache_state_tiled_weight_shmem(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state16_gate_cache_tiled_weight_shmem_partial_sums,
                 )
             )
         elif ctx.use_persistent_state16_gate_cache_tiled_backward_kernel:
@@ -2577,6 +3510,22 @@ class A100GRUH256Function(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -2606,12 +3555,28 @@ def a100_gru_h256(
     use_persistent_state8_backward_kernel: bool = False,
     use_persistent_state16_backward_kernel: bool = False,
     use_persistent_state16_gate_cache_backward_kernel: bool = False,
+    use_persistent_state8_gate_cache_tiled_backward_kernel: bool = False,
     use_persistent_state16_gate_cache_tiled_backward_kernel: bool = False,
+    use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel: bool = False,
+    use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+    use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+    use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+    use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel: bool = False,
     use_persistent_state16_grad_coeff_cache_tiled_backward_kernel: bool = False,
     use_persistent_state32_gate_cache_tiled_backward_kernel: bool = False,
     use_gate_cache_parallel_update_forward_kernel: bool = False,
     use_gate_cache_cta8_forward_kernel: bool = False,
     use_gate_cache_cta6_forward_kernel: bool = False,
+    use_gate_cache_htile2_forward_kernel: bool = False,
+    use_gate_cache_htile4_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_row3_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_row4_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel: bool = False,
+    use_gate_cache_htile8_compact_forward_kernel: bool = False,
     use_persistent_state16_global_gates_backward_kernel: bool = False,
     use_persistent_state32_backward_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2641,12 +3606,28 @@ def a100_gru_h256(
         use_persistent_state8_backward_kernel,
         use_persistent_state16_backward_kernel,
         use_persistent_state16_gate_cache_backward_kernel,
+        use_persistent_state8_gate_cache_tiled_backward_kernel,
         use_persistent_state16_gate_cache_tiled_backward_kernel,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
+        use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
+        use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel,
         use_persistent_state16_grad_coeff_cache_tiled_backward_kernel,
         use_persistent_state32_gate_cache_tiled_backward_kernel,
         use_gate_cache_parallel_update_forward_kernel,
         use_gate_cache_cta8_forward_kernel,
         use_gate_cache_cta6_forward_kernel,
+        use_gate_cache_htile2_forward_kernel,
+        use_gate_cache_htile4_forward_kernel,
+        use_gate_cache_htile4_compact_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_row3_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel,
+        use_gate_cache_htile8_compact_forward_kernel,
         use_persistent_state16_global_gates_backward_kernel,
         use_persistent_state32_backward_kernel,
     )
@@ -2678,12 +3659,28 @@ class A100GRUH256(nn.Module):
         use_persistent_state8_backward_kernel: bool = False,
         use_persistent_state16_backward_kernel: bool = False,
         use_persistent_state16_gate_cache_backward_kernel: bool = False,
+        use_persistent_state8_gate_cache_tiled_backward_kernel: bool = False,
         use_persistent_state16_gate_cache_tiled_backward_kernel: bool = False,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel: bool = False,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel: bool = False,
         use_persistent_state16_grad_coeff_cache_tiled_backward_kernel: bool = False,
         use_persistent_state32_gate_cache_tiled_backward_kernel: bool = False,
         use_gate_cache_parallel_update_forward_kernel: bool = False,
         use_gate_cache_cta8_forward_kernel: bool = False,
         use_gate_cache_cta6_forward_kernel: bool = False,
+        use_gate_cache_htile2_forward_kernel: bool = False,
+        use_gate_cache_htile4_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row3_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel: bool = False,
+        use_gate_cache_htile8_compact_forward_kernel: bool = False,
         use_persistent_state16_global_gates_backward_kernel: bool = False,
         use_persistent_state32_backward_kernel: bool = False,
     ) -> None:
@@ -2726,8 +3723,26 @@ class A100GRUH256(nn.Module):
         self.use_persistent_state16_gate_cache_backward_kernel = (
             use_persistent_state16_gate_cache_backward_kernel
         )
+        self.use_persistent_state8_gate_cache_tiled_backward_kernel = (
+            use_persistent_state8_gate_cache_tiled_backward_kernel
+        )
         self.use_persistent_state16_gate_cache_tiled_backward_kernel = (
             use_persistent_state16_gate_cache_tiled_backward_kernel
+        )
+        self.use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel
+        )
+        self.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
+        self.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
+        self.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
+        self.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel = (
+            use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel
         )
         self.use_persistent_state16_grad_coeff_cache_tiled_backward_kernel = (
             use_persistent_state16_grad_coeff_cache_tiled_backward_kernel
@@ -2740,6 +3755,32 @@ class A100GRUH256(nn.Module):
         )
         self.use_gate_cache_cta8_forward_kernel = use_gate_cache_cta8_forward_kernel
         self.use_gate_cache_cta6_forward_kernel = use_gate_cache_cta6_forward_kernel
+        self.use_gate_cache_htile2_forward_kernel = use_gate_cache_htile2_forward_kernel
+        self.use_gate_cache_htile4_forward_kernel = use_gate_cache_htile4_forward_kernel
+        self.use_gate_cache_htile4_compact_forward_kernel = (
+            use_gate_cache_htile4_compact_forward_kernel
+        )
+        self.use_gate_cache_htile4_compact_hoist_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_forward_kernel
+        )
+        self.use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel
+        )
+        self.use_gate_cache_htile4_compact_hoist_row3_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_row3_forward_kernel
+        )
+        self.use_gate_cache_htile4_compact_hoist_row4_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_row4_forward_kernel
+        )
+        self.use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel
+        )
+        self.use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel
+        )
+        self.use_gate_cache_htile8_compact_forward_kernel = (
+            use_gate_cache_htile8_compact_forward_kernel
+        )
         self.use_persistent_state16_global_gates_backward_kernel = (
             use_persistent_state16_global_gates_backward_kernel
         )
@@ -2804,8 +3845,26 @@ class A100GRUH256(nn.Module):
             use_persistent_state16_gate_cache_backward_kernel=(
                 self.use_persistent_state16_gate_cache_backward_kernel
             ),
+            use_persistent_state8_gate_cache_tiled_backward_kernel=(
+                self.use_persistent_state8_gate_cache_tiled_backward_kernel
+            ),
             use_persistent_state16_gate_cache_tiled_backward_kernel=(
                 self.use_persistent_state16_gate_cache_tiled_backward_kernel
+            ),
+            use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel=(
+                self.use_persistent_state16_gate_cache_tiled_weight_shmem_backward_kernel
+            ),
+            use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                self.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            ),
+            use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                self.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            ),
+            use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                self.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            ),
+            use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel=(
+                self.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_own_shmem_backward_kernel
             ),
             use_persistent_state16_grad_coeff_cache_tiled_backward_kernel=(
                 self.use_persistent_state16_grad_coeff_cache_tiled_backward_kernel
@@ -2818,6 +3877,36 @@ class A100GRUH256(nn.Module):
             ),
             use_gate_cache_cta8_forward_kernel=self.use_gate_cache_cta8_forward_kernel,
             use_gate_cache_cta6_forward_kernel=self.use_gate_cache_cta6_forward_kernel,
+            use_gate_cache_htile2_forward_kernel=(
+                self.use_gate_cache_htile2_forward_kernel
+            ),
+            use_gate_cache_htile4_forward_kernel=(
+                self.use_gate_cache_htile4_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_forward_kernel=(
+                self.use_gate_cache_htile4_compact_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_hoist_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_hoist_row3_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_row3_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_hoist_row4_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_row4_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel
+            ),
+            use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_row4_weight_shmem_forward_kernel
+            ),
+            use_gate_cache_htile8_compact_forward_kernel=(
+                self.use_gate_cache_htile8_compact_forward_kernel
+            ),
             use_persistent_state16_global_gates_backward_kernel=(
                 self.use_persistent_state16_global_gates_backward_kernel
             ),

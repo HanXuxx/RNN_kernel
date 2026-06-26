@@ -90,23 +90,36 @@ PyTorch。
    h256 forward-only 已经快于 cuDNN：通用 cooperative4 为 `81.918 ms`，h256 专用
    shmem cooperative 为 `73.540 ms`，cuDNN 为 `111.976 ms`。
 7. 下一步聚焦 h256，不再把 h130/160/192 作为主 benchmark。h256 backward 正确性
-   原型和第一轮性能优化已完成，见 `docs/a100_h256_backward_study.md`。
+   原型和多轮训练闭环优化已完成；当前 A100 seq8000 最佳为 htile4 compact hoist row4
+   forward + split12 persistent-state gate-cache tiled weight-shmem split0-keep
+   backward，GPU3 同窗口 timed_steps=10 为 `94.286 ms/step`，同卡 cuDNN 为
+   `247.279 ms/step`，见
+   `docs/a100_h256_backward_study.md`。
 8. 初始阶段专门覆盖真实基准测试约束：单向 GRU、batch-first 输入、固定 dtype
    模式，以及 hidden size 大于 128。
 9. h256 forward 已经达到继续投入 backward 的门槛；当前 pointwise CUDA backward、
    跨 time step batched GEMM、fused backward step kernel、cooperative split
    backward step、persistent backward sequence kernel、persistent-state kernel、
-   split16 persistent-state kernel、split16 persistent-state gate-cache kernel 和
-   split16 persistent-state gate-cache tiled kernel
+   split16 persistent-state kernel、split16 persistent-state gate-cache kernel、
+   split16 persistent-state gate-cache tiled kernel、htile2 forward 分支、htile4
+   forward 分支、htile4 compact partial-buffer 分支、htile4 compact hoist 分支、
+   htile4 compact hoist row4 分支、split8 gate-cache tiled 负向实验、
+   split16 weight-shmem backward 正向实验、split0-keep partial 回读正向实验、
+   split12 weight-shmem split0-keep 正向实验、split0-keep own-shmem 负向实验、
+   split24 weight-shmem split0-keep 负向实验、row4 forward weight-shmem/hidden-shmem
+   负向实验、qwarp/row3 forward 负向实验和 htile8 compact 负向实验
    已完成。seq8000 timed_steps=10 顺序复测下最佳自定义训练结果为
-   `137.471 ms/step`，快于同配置 cuDNN 复测的 `251.414 ms/step`，约 `1.83x`。
+   `94.286 ms/step`，快于同卡 cuDNN 复测的 `247.279 ms/step`，约 `2.62x`。
    `recompute_hidden_gates`、tiled recurrent、外部分离 split recurrent partial-buffer、
    split2 gate-cache、persistent-state-local、split32、split16 global-gates、
    split32 gate-cache tiled、grad-coeff-cache tiled、gate-cache parallel-update forward、
    gate-cache CTA8 forward 和 gate-cache CTA6 forward 路径都已验证为负向或中性实验；
-   split16 persistent-state gate-cache tiled 是当前正向候选，下一步应优化 CTA4 shmem
-   forward gate-cache kernel、backward split16 gate-cache tiled kernel、剩余 grid sync、
-   partial 规约和 reserve-space 显存/带宽成本。
+   htile4-compact-hoist-row4-256 是当前长序列最快 forward 候选，split12 是当前 backward
+   split-count 甜点，split8 太少、split24 太多；htile8-compact 已验证继续增加 hidden
+   tile 数会退化，htile2 的 seq_len 扫描显示收益从 1024 之后更稳定；下一步
+   应优化 row4 的 partial buffer 写读路径、pointwise/SFU 成本、backward
+   weight-shmem shared-memory tile、剩余 grid sync、partial 规约读写和 reserve-space
+   显存/带宽成本。
 10. 与 cuDNN GRU 对比速度、显存和数值容差。
 11. 增加类似 CI 的本地检查：构建、单元测试、CPU 冒烟基准测试和 GPU 基准测试
    命令模板。

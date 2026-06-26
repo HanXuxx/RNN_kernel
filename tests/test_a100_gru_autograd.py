@@ -10,6 +10,7 @@ from rnn_kernel.a100.gru_autograd import (
     _a100_gru_h256_backward_step_cooperative_split2_gate_cache,
     _a100_gru_h256_backward_step_cooperative_split_cached,
     _a100_gru_h256_backward_step_recompute,
+    _a100_gru_h256_pack_hidden_prev_time_major,
     _a100_gru_h256_pointwise_backward,
     _a100_gru_h256_recurrent_backward,
     _a100_gru_h256_recurrent_backward_split,
@@ -70,6 +71,23 @@ def test_a100_gru_h256_autograd_matches_torch_gru() -> None:
 def test_a100_gru_h256_rejects_non_h256() -> None:
     with pytest.raises(ValueError, match="hidden_size=256"):
         A100GRUH256(input_size=5, hidden_size=128)
+
+
+def test_a100_gru_h256_pack_hidden_prev_time_major_matches_torch_layout() -> None:
+    _requires_a100()
+    torch.manual_seed(2122)
+    device = torch.device("cuda")
+    batch_size = 3
+    seq_len = 7
+    hidden_size = 256
+
+    h0 = torch.randn(batch_size, hidden_size, device=device)
+    output = torch.randn(batch_size, seq_len, hidden_size, device=device)
+
+    packed = _a100_gru_h256_pack_hidden_prev_time_major(h0, output)
+    reference = torch.cat((h0.unsqueeze(1), output[:, :-1, :]), dim=1).transpose(0, 1).contiguous()
+
+    assert torch.equal(packed, reference)
 
 
 def test_a100_gru_h256_autograd_supports_final_hidden_only_loss() -> None:
@@ -1827,6 +1845,336 @@ def test_a100_gru_h256_persistent_state12_gate_cache_tiled_weight_shmem_split0_k
         input_size=input_size,
         block_threads=256,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2112)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_pack_prev_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2123)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel=True,
+        use_pack_hidden_prev_time_major_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2119)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_ldg_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2118)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_ldg_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_parallel_update_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2120)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_parallel_update_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_prev_cache_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2121)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_htile4_compact_hoist_row4_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2111)
+    device = torch.device("cuda")
+    input_size = 5
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel=True,
         use_gate_cache_htile4_compact_hoist_row4_forward_kernel=True,
     ).to(device)
     copy_from_torch_gru(a100_gru, torch_gru)

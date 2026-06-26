@@ -529,8 +529,8 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/benchmark_a100_forward.py \
 
 A100 专用 forward-only 优化有效，已经快于 cuDNN forward。后续 h256 backward 训练
 闭环已经在 `docs/a100_h256_backward_study.md` 中推进到超过 cuDNN 的自定义路径；当前
-训练闭环最佳为 htile4 compact hoist row4 forward + split12 weight-shmem split0-keep
-backward，seq8000 timed_steps=10 为 `94.286 ms/step`。本文档保留 forward-only 阶段的设计和
+训练闭环最佳为 htile4 compact hoist row4 forward + split6 weight-shmem split0-keep
+backward + hidden-prev pack，seq8000 timed_steps=10 为 `93.185 ms/step`。本文档保留 forward-only 阶段的设计和
 负向实验结论；训练闭环的最新数字以 backward 研究文档为准。
 
 已经确认的有效点：
@@ -577,15 +577,23 @@ tiled backward，以及 htile4 compact hoist row4 forward 均已完成，见
 4. backward 已完成第一轮有效优化：pointwise CUDA kernel、recurrent gate 聚合、
    `weight_hh` 梯度聚合和 fused backward step。recompute hidden gates 与 tiled
    recurrent、外部分离 split recurrent partial-buffer 路径都没有超过 fused step。
-   当前 h256 训练主线已经推进到 htile4 compact hoist row4 forward + split12
-   weight-shmem split0-keep backward，seq8000 timed_steps=10 最佳为
-   `94.286 ms/step`，forward `59.349 ms`，backward `34.450 ms`。下一步需要同时优化 row4 的
+   当前 h256 训练主线已经推进到 htile4 compact hoist row4 forward + split6
+   weight-shmem split0-keep backward + hidden-prev pack，seq8000 timed_steps=10 最佳为
+   `93.185 ms/step`，forward `59.801 ms`，backward `33.002 ms`。下一步需要同时优化 row4 的
    寄存器/occupancy 权衡、forward partial buffer 写读路径、weight-shmem backward
    的 shared-memory tile 细节、partial 规约读写，以及 reserve-space 带来的显存/带宽成本。本轮已验证
-   gate-cache parallel-update、CTA8 forward、CTA6 forward、row4 forward weight-shmem、
-   row4 forward hidden-shmem、qwarp forward、row3 forward、split8 backward、split24 backward、
-   split32 gate-cache tiled 和 grad-coeff-cache tiled 都没有超过当前主线；htile8-compact
-   也已验证为负向边界。
+   gate-cache parallel-update、CTA8 forward、CTA6 forward、row4 forward ldg、
+   row4 forward prev-cache、row4 forward parallel-update、row4 forward weight-shmem、row4 forward hidden-shmem、
+   qwarp forward、row3 forward、split8 backward、split12 unroll8 backward、split5 backward、split24 backward、
+   split32 gate-cache tiled 和 grad-coeff-cache tiled 都没有超过当前主线；
+   htile8-compact 也已验证为负向边界。row4_ldg 在 `__launch_bounds__(256, 3)`
+   后寄存器为 `67/thread`，但 seq8000 forward 仍退化到 `68.936 ms`，说明显式
+   只读加载不是当前 forward 瓶颈解法；row4_prev_cache 让 backward 少约 `0.49 ms`
+   但 forward 多约 `2.1 ms`，整体负向；row4_parallel_update 把 k0 partial 写入
+   global 并分摊 update 后，forward 为 `62.484 ms`，说明分散 pointwise/SFU 没有抵消
+   额外 partial 读写。hidden-prev pack 不改 forward，只在 backward 开始用 vectorized
+   pack 替代 `torch.cat(...).transpose().contiguous()`，同场 t10 把 step 从 `93.644 ms`
+   降到 `93.185 ms`。
    htile4-compact-hoist-row4-256 是当前长序列最快 forward 分支，htile2 的 seq_len
    扫描显示 1024 之后收益更稳定。
 5. 如果保持 NVRTC 路线，继续把 CUDA 源码放在 `.cu` 文件中；如果补齐项目内 `nvcc`，

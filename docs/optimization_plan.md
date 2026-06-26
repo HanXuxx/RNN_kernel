@@ -91,8 +91,8 @@ PyTorch。
    shmem cooperative 为 `73.540 ms`，cuDNN 为 `111.976 ms`。
 7. 下一步聚焦 h256，不再把 h130/160/192 作为主 benchmark。h256 backward 正确性
    原型和多轮训练闭环优化已完成；当前 A100 seq8000 最佳为 htile4 compact hoist row4
-   forward + split12 persistent-state gate-cache tiled weight-shmem split0-keep
-   backward，GPU3 同窗口 timed_steps=10 为 `94.286 ms/step`，同卡 cuDNN 为
+   forward + split6 persistent-state gate-cache tiled weight-shmem split0-keep
+   backward + hidden-prev pack，GPU3 同窗口 timed_steps=10 为 `93.185 ms/step`，同卡 cuDNN 为
    `247.279 ms/step`，见
    `docs/a100_h256_backward_study.md`。
 8. 初始阶段专门覆盖真实基准测试约束：单向 GRU、batch-first 输入、固定 dtype
@@ -105,18 +105,21 @@ PyTorch。
    forward 分支、htile4 compact partial-buffer 分支、htile4 compact hoist 分支、
    htile4 compact hoist row4 分支、split8 gate-cache tiled 负向实验、
    split16 weight-shmem backward 正向实验、split0-keep partial 回读正向实验、
-   split12 weight-shmem split0-keep 正向实验、split0-keep own-shmem 负向实验、
-   split24 weight-shmem split0-keep 负向实验、row4 forward weight-shmem/hidden-shmem
-   负向实验、qwarp/row3 forward 负向实验和 htile8 compact 负向实验
+   split12 weight-shmem split0-keep 正向实验、split6 weight-shmem split0-keep 正向实验、
+   split0-keep own-shmem 负向实验、split5 weight-shmem split0-keep 负向实验、
+   split12 dot-loop unroll8 中性偏负实验、split24 weight-shmem split0-keep 负向实验、
+   row4 forward ldg/prev-cache/parallel-update/weight-shmem/hidden-shmem 负向实验、
+   hidden-prev pack 正向实验、qwarp/row3 forward 负向实验和 htile8 compact 负向实验
    已完成。seq8000 timed_steps=10 顺序复测下最佳自定义训练结果为
-   `94.286 ms/step`，快于同卡 cuDNN 复测的 `247.279 ms/step`，约 `2.62x`。
+   `93.185 ms/step`，快于同卡 cuDNN 复测的 `247.279 ms/step`，约 `2.65x`。
    `recompute_hidden_gates`、tiled recurrent、外部分离 split recurrent partial-buffer、
    split2 gate-cache、persistent-state-local、split32、split16 global-gates、
    split32 gate-cache tiled、grad-coeff-cache tiled、gate-cache parallel-update forward、
    gate-cache CTA8 forward 和 gate-cache CTA6 forward 路径都已验证为负向或中性实验；
-   htile4-compact-hoist-row4-256 是当前长序列最快 forward 候选，split12 是当前 backward
-   split-count 甜点，split8 太少、split24 太多；htile8-compact 已验证继续增加 hidden
-   tile 数会退化，htile2 的 seq_len 扫描显示收益从 1024 之后更稳定；下一步
+   htile4-compact-hoist-row4-256 是当前长序列最快 forward 候选，split6 是当前 backward
+   split-count 甜点，hidden-prev pack 是当前唯一正向的 reserve-space 布局准备优化，
+   split5 shared-memory tile 太重，split12 dot-loop unroll8 未稳定超过主线，split24 太多；
+   htile8-compact 已验证继续增加 hidden tile 数会退化，htile2 的 seq_len 扫描显示收益从 1024 之后更稳定；下一步
    应优化 row4 的 partial buffer 写读路径、pointwise/SFU 成本、backward
    weight-shmem shared-memory tile、剩余 grid sync、partial 规约读写和 reserve-space
    显存/带宽成本。

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rnn-kernel"
+version = "0.1.0"
+description = "A100/H200 GRU training kernel experiments and A100 h256 prod wrapper"
+requires-python = ">=3.10"
+dependencies = [
+    "cuda-python>=12.4",
+    "torch>=2.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"rnn_kernel.a100.prod.kernels" = ["*.cubin", "*.cu"]

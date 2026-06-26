@@ -1,0 +1,2 @@
+cuda-python>=12.4
+torch>=2.6

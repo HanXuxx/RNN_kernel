@@ -1,0 +1,6 @@
+recursive-include a100_gru_h256/kernels *.cubin *.cu
+recursive-include a100_gru_h256/docs *.md
+recursive-include a100_gru_h256/scripts *.py *.sh
+include a100_gru_h256/README.md
+include a100_gru_h256/requirements-runtime.txt
+include a100_gru_h256/requirements-build.txt

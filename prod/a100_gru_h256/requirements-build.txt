@@ -1,0 +1,6 @@
+-r requirements-runtime.txt
+nvidia-cuda-nvcc-cu12>=12.4
+nvidia-cuda-nvrtc-cu12>=12.4
+nvidia-cuda-runtime-cu12>=12.4
+wheel
+setuptools>=68

@@ -72,6 +72,9 @@ _COOPERATIVE_H256_HTILE4_COMPACT_HOIST_SHMEM_GATE_CACHE_GATES_KERNEL_NAME = (
 _COOPERATIVE_H256_HTILE4_COMPACT_HOIST_ROW4_SHMEM_GATE_CACHE_GATES_KERNEL_NAME = (
     b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache_kernel"
 )
+_COOPERATIVE_H256_HTILE4_COMPACT_HOIST_ROW4_NO_CACHE_GATES_KERNEL_NAME = (
+    b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_kernel"
+)
 _COOPERATIVE_H256_HTILE4_COMPACT_HOIST_ROW4_PREV_CACHE_SHMEM_GATE_CACHE_GATES_KERNEL_NAME = (
     b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache_kernel"
 )
@@ -227,6 +230,7 @@ class _CompiledKernel:
     cooperative_h256_htile4_compact_shmem_gate_cache_gates_function: object
     cooperative_h256_htile4_compact_hoist_shmem_gate_cache_gates_function: object
     cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache_gates_function: object
+    cooperative_h256_htile4_compact_hoist_row4_no_cache_gates_function: object
     cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache_gates_function: object
     cooperative_h256_htile4_compact_hoist_row4_parallel_update_gate_cache_gates_function: object
     cooperative_h256_htile4_compact_hoist_row4_ldg_shmem_gate_cache_gates_function: object
@@ -499,6 +503,13 @@ def _compile_a100_kernel() -> _CompiledKernel:
         cuda.cuModuleGetFunction(
             module,
             _COOPERATIVE_H256_HTILE4_COMPACT_HOIST_ROW4_SHMEM_GATE_CACHE_GATES_KERNEL_NAME,
+        )
+    )
+    _check_cuda_error(err)
+    err, cooperative_h256_htile4_compact_hoist_row4_no_cache_gates_function = (
+        cuda.cuModuleGetFunction(
+            module,
+            _COOPERATIVE_H256_HTILE4_COMPACT_HOIST_ROW4_NO_CACHE_GATES_KERNEL_NAME,
         )
     )
     _check_cuda_error(err)
@@ -826,6 +837,9 @@ def _compile_a100_kernel() -> _CompiledKernel:
         ),
         cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache_gates_function=(
             cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache_gates_function
+        ),
+        cooperative_h256_htile4_compact_hoist_row4_no_cache_gates_function=(
+            cooperative_h256_htile4_compact_hoist_row4_no_cache_gates_function
         ),
         cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache_gates_function=(
             cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache_gates_function
@@ -3053,6 +3067,136 @@ def a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shmem
     )
     _check_cuda_error(err)
     return output, gate_cache
+
+
+def a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache(
+    input_gates: torch.Tensor,
+    h0: torch.Tensor,
+    weight_hh: torch.Tensor,
+    bias_hh: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    """运行 row4 hidden 行分配的 h256 forward-only kernel。"""
+    _require_cuda_python()
+    _validate_block_threads(block_threads)
+    if block_threads != 256:
+        raise ValueError(
+            "a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache "
+            "requires block_threads=256."
+        )
+    batch_size, seq_len, hidden_size = _validate_input_gates(
+        input_gates,
+        h0,
+        weight_hh,
+        bias_hh,
+    )
+    if hidden_size != 256:
+        raise ValueError(
+            "a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache "
+            "requires hidden_size=256."
+        )
+
+    device_index = input_gates.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    torch.cuda.set_device(device_index)
+    capability = _device_capability(device_index)
+    if capability != (8, 0):
+        raise RuntimeError(
+            "a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache "
+            f"requires SM80/A100, got sm_{capability[0]}{capability[1]}."
+        )
+    cooperative_launch = _device_attribute(
+        device_index,
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH,
+    )
+    if cooperative_launch == 0:
+        raise RuntimeError("Current CUDA device does not support cooperative launch.")
+
+    input_gates = input_gates.contiguous()
+    h0 = h0.contiguous()
+    weight_hh = weight_hh.contiguous()
+    bias_hh = bias_hh.contiguous()
+
+    hidden_tile = hidden_size // 4
+    ctas_per_batch = 16
+    compact_partials_per_batch = 12
+    output = torch.empty(
+        batch_size,
+        seq_len,
+        hidden_size,
+        device=input_gates.device,
+        dtype=input_gates.dtype,
+    )
+    partial_gates = torch.empty(
+        batch_size * compact_partials_per_batch,
+        3 * hidden_tile,
+        device=input_gates.device,
+        dtype=input_gates.dtype,
+    )
+    hidden_state = torch.empty(
+        batch_size,
+        hidden_size,
+        device=input_gates.device,
+        dtype=input_gates.dtype,
+    )
+
+    compiled = _get_a100_kernel()
+    shared_bytes = 3 * hidden_tile * ctypes.sizeof(ctypes.c_float)
+    err, active_blocks_per_sm = cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        compiled.cooperative_h256_htile4_compact_hoist_row4_no_cache_gates_function,
+        block_threads,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    sm_count = _device_attribute(
+        device_index,
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+    )
+    grid_blocks = batch_size * ctas_per_batch
+    max_cooperative_blocks = active_blocks_per_sm * sm_count
+    if grid_blocks > max_cooperative_blocks:
+        raise ValueError(
+            "h256 htile4 compact hoist row4 no-cache cooperative grid is too large "
+            "for resident launch: "
+            f"grid_blocks={grid_blocks}, max={max_cooperative_blocks}."
+        )
+
+    stream = cuda.CUstream(torch.cuda.current_stream(device=input_gates.device).cuda_stream)
+    values = (
+        ctypes.c_void_p(input_gates.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(bias_hh.data_ptr()),
+        ctypes.c_void_p(partial_gates.data_ptr()),
+        ctypes.c_void_p(hidden_state.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        compiled.cooperative_h256_htile4_compact_hoist_row4_no_cache_gates_function,
+        grid_blocks,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return output
 
 
 def a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache(

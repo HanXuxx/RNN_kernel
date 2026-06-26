@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a100-gru-h256"
+version = "0.1.0"
+description = "Standalone A100/SM80 fp32 GRU hidden_size=256 training kernel"
+requires-python = ">=3.10"
+dependencies = [
+    "cuda-python>=12.4",
+    "torch>=2.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["a100_gru_h256*"]
+
+[tool.setuptools.package-data]
+"a100_gru_h256" = [
+    "README.md",
+    "requirements-runtime.txt",
+    "requirements-build.txt",
+    "docs/*.md",
+    "scripts/*.py",
+    "scripts/*.sh",
+]
+"a100_gru_h256.kernels" = ["*.cubin", "*.cu"]

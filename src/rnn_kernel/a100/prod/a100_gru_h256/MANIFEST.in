@@ -1,0 +1,6 @@
+recursive-include kernels *.cubin *.cu
+recursive-include docs *.md
+recursive-include scripts *.py *.sh
+include README.md
+include requirements-runtime.txt
+include requirements-build.txt

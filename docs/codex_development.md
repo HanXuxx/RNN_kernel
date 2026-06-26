@@ -14,6 +14,12 @@
 8. 性能分析输出和 CSV 视为生成产物；把长期有效的发现总结到 `docs/`，不直接
    提交大量原始文件。
 9. 代码使用英文，注释使用中文；不要把中文用于变量名、函数名、类名或文件名。
+10. A100 相关优化必须先在 `src/rnn_kernel/a100` 实验区完成实现、正确性验证和
+    性能验证；实验通过后，才允许把成熟的最优代码迁移到
+    `src/rnn_kernel/a100/prod`。
+11. 顶层 `/home/xuh/RNN_kernel/prod` 只允许由
+    `src/rnn_kernel/a100/prod/scripts/export_a100_gru_h256.py` 一键导出生成，
+    不手动复制或手动修改。
 
 ## 代码与注释语言
 
@@ -57,6 +63,20 @@ python rnn_benchmark.py --device cuda --cell-types GRU --hidden-sizes 128,160,19
 - 正确性测试和容差检查放到 `tests/`。
 - 可复用性能分析命令放到 `scripts/`。
 - 生成的性能结果放到 `results/` 或 `profiles/`。
+
+## A100 prod 迁移流程
+
+1. 在 `src/rnn_kernel/a100` 中实现实验 kernel、Python launcher 和局部 benchmark。
+2. 使用 A100 跑正确性验证，至少覆盖 forward 输出；如果涉及训练路径，还必须覆盖
+   backward 梯度。
+3. 记录关键性能数字和命令。只把稳定结论写入 `docs/`，不把临时实验输出作为
+   唯一依据。
+4. 将通过验证的最优实现迁移到 `src/rnn_kernel/a100/prod`。prod 运行时不能依赖
+   实验模块、NVRTC 或系统 `nvcc`。
+5. 在 `src/rnn_kernel/a100/prod/a100_gru_h256` 中同步独立包源码、脚本和文档。
+6. 运行 `src/rnn_kernel/a100/prod/scripts/export_a100_gru_h256.py` 生成顶层
+   `prod/a100_gru_h256` 和 wheel。顶层 `prod` 目录视为构建产物。
+7. 从顶层 `prod` 和 wheel 分别运行 functional test，确认导出产物和源目录一致。
 
 ## 性能评审检查表
 

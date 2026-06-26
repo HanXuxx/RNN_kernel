@@ -2226,6 +2226,156 @@ void a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shme
     }
 }
 
+extern "C" __global__
+void a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_kernel(
+    const float* __restrict__ input_gates,
+    const float* __restrict__ h0,
+    const float* __restrict__ weight_hh,
+    const float* __restrict__ bias_hh,
+    float* __restrict__ partial_gates,
+    float* __restrict__ hidden_state,
+    float* __restrict__ output,
+    int seq_len)
+{
+    constexpr int HIDDEN_SIZE = 256;
+    constexpr int H_TILES = 4;
+    constexpr int H_TILE = HIDDEN_SIZE / H_TILES;
+    constexpr int K_CTAS = 4;
+    constexpr int K_TILE = HIDDEN_SIZE / K_CTAS;
+    constexpr int CTAS_PER_BATCH = H_TILES * K_CTAS;
+    constexpr int COMPACT_PARTIALS_PER_BATCH = H_TILES * (K_CTAS - 1);
+    constexpr int PARTIAL_STRIDE = 3 * H_TILE;
+    constexpr int GROUPS_PER_BLOCK = 16;
+
+    extern __shared__ float shared[];
+    float* partial0_local = shared;
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int global_cta = blockIdx.x;
+    const int batch_idx = global_cta >> 4;
+    const int cta_idx = global_cta & (CTAS_PER_BATCH - 1);
+    const int h_tile_idx = cta_idx >> 2;
+    const int k_cta_idx = cta_idx & (K_CTAS - 1);
+    const int tid = threadIdx.x;
+    const int warp_lane = tid & (WARP_SIZE - 1);
+    const int lane = tid & 15;
+    const int group_idx = tid >> 4;
+    const unsigned int group_mask = 0xffffu << (warp_lane & 16);
+
+    const int h_begin = h_tile_idx * H_TILE;
+    const int k_begin = k_cta_idx * K_TILE;
+    const int partial_base_idx = batch_idx * COMPACT_PARTIALS_PER_BATCH
+        + h_tile_idx * (K_CTAS - 1);
+    float* partial_out_base = partial0_local;
+    if (k_cta_idx != 0) {
+        partial_out_base = partial_gates + (partial_base_idx + k_cta_idx - 1) * PARTIAL_STRIDE;
+    }
+    const float* partial1_base = partial_gates + partial_base_idx * PARTIAL_STRIDE;
+    const float* partial2_base = partial1_base + PARTIAL_STRIDE;
+    const float* partial3_base = partial2_base + PARTIAL_STRIDE;
+    float* hidden = hidden_state + batch_idx * HIDDEN_SIZE;
+
+    if (k_cta_idx == 0) {
+        for (int h_local = tid; h_local < H_TILE; h_local += blockDim.x) {
+            const int hid = h_begin + h_local;
+            hidden[hid] = h0[batch_idx * HIDDEN_SIZE + hid];
+        }
+    }
+    grid.sync();
+
+    for (int step = 0; step < seq_len; ++step) {
+        const float* input_step = input_gates + (batch_idx * seq_len + step) * 3 * HIDDEN_SIZE;
+        float* output_step = output + (batch_idx * seq_len + step) * HIDDEN_SIZE;
+
+        // 推理路径不写 gate cache，只保留 recurrent projection 和输出状态。
+#pragma unroll
+        for (int pair_idx = 0; pair_idx < 2; ++pair_idx) {
+            const int pair_base = pair_idx * 2 * GROUPS_PER_BLOCK;
+            const int h0_local = group_idx + pair_base;
+            const int h1_local = h0_local + GROUPS_PER_BLOCK;
+            const int hid0 = h_begin + h0_local;
+            const int hid1 = h_begin + h1_local;
+
+            const float* weight_r0 = weight_hh + hid0 * HIDDEN_SIZE + k_begin;
+            const float* weight_z0 = weight_hh + (HIDDEN_SIZE + hid0) * HIDDEN_SIZE + k_begin;
+            const float* weight_n0 = weight_hh + (2 * HIDDEN_SIZE + hid0) * HIDDEN_SIZE + k_begin;
+            const float* weight_r1 = weight_hh + hid1 * HIDDEN_SIZE + k_begin;
+            const float* weight_z1 = weight_hh + (HIDDEN_SIZE + hid1) * HIDDEN_SIZE + k_begin;
+            const float* weight_n1 = weight_hh + (2 * HIDDEN_SIZE + hid1) * HIDDEN_SIZE + k_begin;
+
+            float acc_r0 = 0.0f;
+            float acc_z0 = 0.0f;
+            float acc_n0 = 0.0f;
+            float acc_r1 = 0.0f;
+            float acc_z1 = 0.0f;
+            float acc_n1 = 0.0f;
+
+#pragma unroll
+            for (int k_local = lane; k_local < K_TILE; k_local += 16) {
+                const int k = k_begin + k_local;
+                const float hidden_value = hidden[k];
+                acc_r0 += hidden_value * weight_r0[k_local];
+                acc_z0 += hidden_value * weight_z0[k_local];
+                acc_n0 += hidden_value * weight_n0[k_local];
+                acc_r1 += hidden_value * weight_r1[k_local];
+                acc_z1 += hidden_value * weight_z1[k_local];
+                acc_n1 += hidden_value * weight_n1[k_local];
+            }
+
+            acc_r0 = half_warp_reduce_sum(acc_r0, group_mask);
+            acc_z0 = half_warp_reduce_sum(acc_z0, group_mask);
+            acc_n0 = half_warp_reduce_sum(acc_n0, group_mask);
+            acc_r1 = half_warp_reduce_sum(acc_r1, group_mask);
+            acc_z1 = half_warp_reduce_sum(acc_z1, group_mask);
+            acc_n1 = half_warp_reduce_sum(acc_n1, group_mask);
+
+            if (lane == 0) {
+                partial_out_base[h0_local] = acc_r0;
+                partial_out_base[H_TILE + h0_local] = acc_z0;
+                partial_out_base[2 * H_TILE + h0_local] = acc_n0;
+                partial_out_base[h1_local] = acc_r1;
+                partial_out_base[H_TILE + h1_local] = acc_z1;
+                partial_out_base[2 * H_TILE + h1_local] = acc_n1;
+            }
+        }
+        grid.sync();
+
+        if (k_cta_idx == 0) {
+            for (int h_local = tid; h_local < H_TILE; h_local += blockDim.x) {
+                const int hid = h_begin + h_local;
+                const float acc_r = bias_hh[hid]
+                    + partial0_local[h_local]
+                    + partial1_base[h_local]
+                    + partial2_base[h_local]
+                    + partial3_base[h_local];
+                const float acc_z = bias_hh[HIDDEN_SIZE + hid]
+                    + partial0_local[H_TILE + h_local]
+                    + partial1_base[H_TILE + h_local]
+                    + partial2_base[H_TILE + h_local]
+                    + partial3_base[H_TILE + h_local];
+                const float acc_n = bias_hh[2 * HIDDEN_SIZE + hid]
+                    + partial0_local[2 * H_TILE + h_local]
+                    + partial1_base[2 * H_TILE + h_local]
+                    + partial2_base[2 * H_TILE + h_local]
+                    + partial3_base[2 * H_TILE + h_local];
+
+                const float i_r = input_step[hid];
+                const float i_z = input_step[HIDDEN_SIZE + hid];
+                const float i_n = input_step[2 * HIDDEN_SIZE + hid];
+                const float reset_gate = 1.0f / (1.0f + expf(-(i_r + acc_r)));
+                const float update_gate = 1.0f / (1.0f + expf(-(i_z + acc_z)));
+                const float new_gate = tanhf(i_n + reset_gate * acc_n);
+                const float hidden_prev = hidden[hid];
+                const float hidden_next = new_gate + update_gate * (hidden_prev - new_gate);
+                hidden[hid] = hidden_next;
+                output_step[hid] = hidden_next;
+            }
+        }
+        grid.sync();
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256, 3)
 void a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache_kernel(
     const float* __restrict__ input_gates,

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .gru_forward import (
     _check_cuda_error,
+    _device_attribute,
     _get_a100_kernel,
     a100_gru_forward_from_gates_cooperative_h256_cta8_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_cta6_shmem_gate_cache,
@@ -19,19 +20,40 @@ from .gru_forward import (
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_qwarp_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row3_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_hidden_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_k1_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_ldg_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_k1,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_k2,
+    a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_ldg,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_parallel_update_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_prev_cache_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_weight_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile4_shmem_gate_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile8_compact_hoist_k1_no_cache,
+    a100_gru_forward_from_gates_cooperative_h256_htile8_compact_hoist_k1_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_htile8_compact_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_parallel_update_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_shmem,
     a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache,
     a100_gru_forward_from_gates_cooperative_h256_shmem_grad_coeff_cache,
+    a100_gru_h256_stacked_backward_naive,
+    a100_gru_h256_stacked_backward_split4,
+    a100_gru_h256_stacked_backward_split4_group8,
+    a100_gru_h256_stacked_backward_split4_shmem,
+    a100_gru_h256_stacked_backward_split6_weight_shmem,
+    a100_gru_h256_stacked_backward_split8,
+    a100_gru_h256_stacked_row4_forward,
+    a100_gru_h256_stacked_row4_k1_train_forward,
+    a100_gru_h256_stacked_row4_train_forward,
+    a100_gru_h256_stacked_forward_naive,
     cuda,
 )
+
+
+MAX_NUM_LAYERS = 4
+MAX_INPUT_SIZE = 16
 
 
 def _a100_gru_h256_pointwise_backward(
@@ -1832,6 +1854,250 @@ def _a100_gru_h256_backward_sequence_cooperative_split6_gate_cache_state_tiled_w
     return grad_hidden_state
 
 
+def _a100_gru_h256_backward_sequence_cooperative_split6_gate_cache_state_tiled_weight_shmem_split0_keep_unroll8(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split6 unroll8 split0-keep weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split6 unroll8 split0-keep weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 6, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 6, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split6_gate_cache_state_tiled_weight_shmem_split0_keep_unroll8_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 128 + 128 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # split6_unroll8 与默认 split6 使用相同 shared memory，只改变循环展开因子。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 6,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
+def _a100_gru_h256_backward_sequence_cooperative_split8_gate_cache_state_tiled_weight_shmem_split0_keep(
+    grad_output: torch.Tensor,
+    grad_hidden_state: torch.Tensor,
+    gate_cache: torch.Tensor,
+    h0: torch.Tensor,
+    output: torch.Tensor,
+    weight_hh: torch.Tensor,
+    grad_input_gates: torch.Tensor,
+    grad_hidden_gates_steps: torch.Tensor,
+    partial_sums: torch.Tensor,
+    block_threads: int = 256,
+) -> torch.Tensor:
+    batch_size, seq_len, cache_size = gate_cache.shape
+    hidden_size = cache_size // 4
+    if hidden_size != 256:
+        raise ValueError(
+            "A100 h256 persistent split8 split0-keep weight-shmem gate-cache backward requires hidden_size=256."
+        )
+    if block_threads != 256:
+        raise ValueError(
+            "A100 h256 persistent split8 split0-keep weight-shmem gate-cache backward requires 256 threads."
+        )
+    if grad_hidden_gates_steps.shape != (seq_len, batch_size, 3 * hidden_size):
+        raise ValueError("grad_hidden_gates_steps must have shape [seq, batch, 3 * hidden].")
+    if partial_sums.shape != (batch_size, 8, hidden_size):
+        raise ValueError("partial_sums must have shape [batch, 8, hidden].")
+    if not gate_cache.is_contiguous():
+        raise ValueError("gate_cache must be contiguous.")
+    if not grad_hidden_gates_steps.is_contiguous() or not partial_sums.is_contiguous():
+        raise ValueError("grad_hidden_gates_steps and partial_sums must be contiguous.")
+
+    grad_output = grad_output.contiguous()
+    grad_hidden_state = grad_hidden_state.contiguous()
+    gate_cache = gate_cache.contiguous()
+    weight_hh = weight_hh.contiguous()
+
+    compiled = _get_a100_kernel()
+    function = (
+        compiled.h256_backward_sequence_cooperative_split8_gate_cache_state_tiled_weight_shmem_split0_keep_function
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=gate_cache.device).cuda_stream)
+    shared_floats = 96 + 96 * hidden_size
+    shared_bytes = shared_floats * ctypes.sizeof(ctypes.c_float)
+    # split8 缓存 96x256 recurrent weight tile，用更小 shared memory 换更多 CTA。
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    err, = cuda.cuFuncSetAttribute(
+        function,
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        100,
+    )
+    _check_cuda_error(err)
+    err, active_blocks_per_sm = cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        function,
+        block_threads,
+        shared_bytes,
+    )
+    _check_cuda_error(err)
+    device_index = gate_cache.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    sm_count = _device_attribute(
+        device_index,
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+    )
+    max_cooperative_blocks = active_blocks_per_sm * sm_count
+    grid_blocks = batch_size * 8
+    if grid_blocks > max_cooperative_blocks:
+        max_batch_per_launch = max_cooperative_blocks // 8
+        if max_batch_per_launch < 1:
+            raise ValueError(
+                "split8 backward cooperative grid is too large for resident launch: "
+                f"grid_blocks={grid_blocks}, max={max_cooperative_blocks}."
+            )
+        # grad_hidden_gates_steps 是 [seq,batch,gate]，按 batch 分块时需要临时 contiguous buffer。
+        for batch_start in range(0, batch_size, max_batch_per_launch):
+            batch_end = min(batch_start + max_batch_per_launch, batch_size)
+            grad_hidden_gates_chunk = torch.empty(
+                seq_len,
+                batch_end - batch_start,
+                3 * hidden_size,
+                device=gate_cache.device,
+                dtype=gate_cache.dtype,
+            )
+            grad_hidden_state_chunk = grad_hidden_state[batch_start:batch_end].contiguous()
+            _a100_gru_h256_backward_sequence_cooperative_split8_gate_cache_state_tiled_weight_shmem_split0_keep(
+                grad_output[batch_start:batch_end],
+                grad_hidden_state_chunk,
+                gate_cache[batch_start:batch_end],
+                h0[batch_start:batch_end],
+                output[batch_start:batch_end],
+                weight_hh,
+                grad_input_gates[batch_start:batch_end],
+                grad_hidden_gates_chunk,
+                partial_sums[batch_start:batch_end],
+                block_threads=block_threads,
+            )
+            grad_hidden_state[batch_start:batch_end].copy_(grad_hidden_state_chunk)
+            grad_hidden_gates_steps[:, batch_start:batch_end, :].copy_(grad_hidden_gates_chunk)
+        return grad_hidden_state
+    values = (
+        ctypes.c_void_p(grad_output.data_ptr()),
+        ctypes.c_void_p(gate_cache.data_ptr()),
+        ctypes.c_void_p(h0.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(weight_hh.data_ptr()),
+        ctypes.c_void_p(grad_input_gates.data_ptr()),
+        ctypes.c_void_p(grad_hidden_gates_steps.data_ptr()),
+        ctypes.c_void_p(partial_sums.data_ptr()),
+        ctypes.c_void_p(grad_hidden_state.data_ptr()),
+        ctypes.c_int(batch_size),
+        ctypes.c_int(seq_len),
+    )
+    types = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    err, = cuda.cuLaunchCooperativeKernel(
+        function,
+        batch_size * 8,
+        1,
+        1,
+        block_threads,
+        1,
+        1,
+        shared_bytes,
+        stream,
+        (values, types),
+    )
+    _check_cuda_error(err)
+    return grad_hidden_state
+
+
 def _a100_gru_h256_pack_hidden_prev_time_major(
     h0: torch.Tensor,
     output: torch.Tensor,
@@ -2794,6 +3060,8 @@ class A100GRUH256Function(torch.autograd.Function):
         use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel: bool = False,
+        use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel: bool = False,
         use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
@@ -2810,6 +3078,8 @@ class A100GRUH256Function(torch.autograd.Function):
         use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row3_forward_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row4_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel: bool = False,
+        use_gate_cache_htile8_compact_hoist_k1_forward_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel: bool = False,
         use_pack_hidden_prev_time_major_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row4_parallel_update_forward_kernel: bool = False,
@@ -2856,6 +3126,8 @@ class A100GRUH256Function(torch.autograd.Function):
             or use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
+            or use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
             or use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
@@ -2983,6 +3255,42 @@ class A100GRUH256Function(torch.autograd.Function):
             and use_gate_cache_htile4_compact_hoist_forward_kernel
         ):
             output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_shmem_gate_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile8_compact_hoist_k1_forward_kernel
+        ):
+            output, gate_cache = (
+                a100_gru_forward_from_gates_cooperative_h256_htile8_compact_hoist_k1_shmem_gate_cache(
+                    input_gates,
+                    h0,
+                    weight_hh,
+                    bias_hh,
+                    block_threads=block_threads,
+                )
+            )
+        elif (
+            (
+                use_persistent_state16_gate_cache_backward_kernel
+                or use_persistent_state8_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_gate_cache_tiled_backward_kernel
+                or use_persistent_state16_weight_shmem_family_backward_kernel
+                or use_persistent_state32_gate_cache_tiled_backward_kernel
+            )
+            and use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel
+        ):
+            output, gate_cache = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_k1_shmem_gate_cache(
                 input_gates,
                 h0,
                 weight_hh,
@@ -3178,7 +3486,8 @@ class A100GRUH256Function(torch.autograd.Function):
                 block_threads=block_threads,
             )
             gate_cache = x.new_empty(0)
-        h_n = output[:, -1, :].unsqueeze(0).contiguous()
+        output_only = getattr(ctx, "output_only", False)
+        h_n = None if output_only else output[:, -1, :].unsqueeze(0).contiguous()
 
         ctx.save_for_backward(
             x,
@@ -3236,6 +3545,12 @@ class A100GRUH256Function(torch.autograd.Function):
         ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
             use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
         )
+        ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel = (
+            use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
+        )
+        ctx.use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
         ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
             use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
         )
@@ -3259,6 +3574,8 @@ class A100GRUH256Function(torch.autograd.Function):
             use_persistent_state16_global_gates_backward_kernel
         )
         ctx.use_persistent_state32_backward_kernel = use_persistent_state32_backward_kernel
+        if output_only:
+            return output
         return output, h_n
 
     @staticmethod
@@ -3294,6 +3611,8 @@ class A100GRUH256Function(torch.autograd.Function):
             or ctx.use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or ctx.use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            or ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
+            or ctx.use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             or ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
             or ctx.use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
@@ -3431,6 +3750,16 @@ class A100GRUH256Function(torch.autograd.Function):
             if ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             else None
         )
+        persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_partial_sums = (
+            torch.empty(batch_size, 6, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
+            else None
+        )
+        persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_partial_sums = (
+            torch.empty(batch_size, 8, hidden_size, device=x.device, dtype=x.dtype)
+            if ctx.use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            else None
+        )
         persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_partial_sums = (
             torch.empty(batch_size, 12, hidden_size, device=x.device, dtype=x.dtype)
             if ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
@@ -3564,6 +3893,39 @@ class A100GRUH256Function(torch.autograd.Function):
                     grad_input_gates,
                     grad_hidden_gates_steps,
                     persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel:
+            assert (
+                persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_partial_sums
+                is not None
+            )
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split6_gate_cache_state_tiled_weight_shmem_split0_keep_unroll8(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_partial_sums,
+                )
+            )
+        elif ctx.use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel:
+            assert persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_partial_sums is not None
+            grad_hidden = (
+                _a100_gru_h256_backward_sequence_cooperative_split8_gate_cache_state_tiled_weight_shmem_split0_keep(
+                    grad_output,
+                    grad_hidden,
+                    gate_cache,
+                    h0,
+                    output,
+                    weight_hh,
+                    grad_input_gates,
+                    grad_hidden_gates_steps,
+                    persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_partial_sums,
                 )
             )
         elif ctx.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel:
@@ -4035,10 +4397,26 @@ class A100GRUH256Function(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
-def a100_gru_h256(
+class A100GRUH256OutputOnlyFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, *args) -> torch.Tensor:
+        ctx.output_only = True
+        return A100GRUH256Function.forward(ctx, *args)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return A100GRUH256Function.backward(ctx, grad_output, None)
+
+
+def _a100_gru_h256_apply(
+    function: type[torch.autograd.Function],
     x: torch.Tensor,
     h0: torch.Tensor,
     weight_ih: torch.Tensor,
@@ -4070,6 +4448,8 @@ def a100_gru_h256(
     use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
     use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
     use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+    use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel: bool = False,
+    use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
     use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
     use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel: bool = False,
     use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
@@ -4086,6 +4466,8 @@ def a100_gru_h256(
     use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel: bool = False,
     use_gate_cache_htile4_compact_hoist_row3_forward_kernel: bool = False,
     use_gate_cache_htile4_compact_hoist_row4_forward_kernel: bool = False,
+    use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel: bool = False,
+    use_gate_cache_htile8_compact_hoist_k1_forward_kernel: bool = False,
     use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel: bool = False,
     use_pack_hidden_prev_time_major_kernel: bool = False,
     use_gate_cache_htile4_compact_hoist_row4_parallel_update_forward_kernel: bool = False,
@@ -4095,8 +4477,8 @@ def a100_gru_h256(
     use_gate_cache_htile8_compact_forward_kernel: bool = False,
     use_persistent_state16_global_gates_backward_kernel: bool = False,
     use_persistent_state32_backward_kernel: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return A100GRUH256Function.apply(
+) -> object:
+    return function.apply(
         x,
         h0,
         weight_ih,
@@ -4128,6 +4510,8 @@ def a100_gru_h256(
         use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
         use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
         use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel,
+        use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel,
         use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel,
@@ -4144,6 +4528,8 @@ def a100_gru_h256(
         use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel,
         use_gate_cache_htile4_compact_hoist_row3_forward_kernel,
         use_gate_cache_htile4_compact_hoist_row4_forward_kernel,
+        use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel,
+        use_gate_cache_htile8_compact_hoist_k1_forward_kernel,
         use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel,
         use_pack_hidden_prev_time_major_kernel,
         use_gate_cache_htile4_compact_hoist_row4_parallel_update_forward_kernel,
@@ -4156,6 +4542,196 @@ def a100_gru_h256(
     )
 
 
+def a100_gru_h256(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    return _a100_gru_h256_apply(A100GRUH256Function, *args, **kwargs)
+
+
+def a100_gru_h256_output_only(*args, **kwargs) -> torch.Tensor:
+    return _a100_gru_h256_apply(A100GRUH256OutputOnlyFunction, *args, **kwargs)
+
+
+def _a100_gru_h256_hybrid_k1_train_forward(
+    x: torch.Tensor,
+    h0: torch.Tensor,
+    layer_params: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...],
+    block_threads: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """实验性 hybrid forward：input projection 走 cuBLAS，recurrent 走 K1 gate-cache kernel。"""
+    batch_size, seq_len, _ = x.shape
+    num_layers = len(layer_params)
+    layer_input = x.contiguous()
+    all_outputs = torch.empty(
+        num_layers,
+        batch_size,
+        seq_len,
+        256,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    gate_cache_all = torch.empty(
+        num_layers,
+        batch_size,
+        seq_len,
+        4 * 256,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    final_output: torch.Tensor | None = None
+
+    for layer, (weight_ih, weight_hh, bias_ih, bias_hh) in enumerate(layer_params):
+        weight_ih = weight_ih.contiguous()
+        weight_hh = weight_hh.contiguous()
+        bias_ih = bias_ih.contiguous()
+        bias_hh = bias_hh.contiguous()
+        input_gates = F.linear(layer_input, weight_ih, bias_ih).contiguous()
+        output, gate_cache = (
+            a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_k1_shmem_gate_cache(
+                input_gates,
+                h0[layer].contiguous(),
+                weight_hh,
+                bias_hh,
+                block_threads=block_threads,
+                output_out=all_outputs[layer],
+                gate_cache_out=gate_cache_all[layer],
+            )
+        )
+        del gate_cache
+        output = output.contiguous()
+        layer_input = output
+        final_output = output
+
+    if final_output is None:
+        raise RuntimeError("hybrid forward requires at least one layer.")
+    h_n = all_outputs[:, :, seq_len - 1, :].contiguous()
+    if all_outputs.shape != (num_layers, batch_size, seq_len, 256):
+        raise RuntimeError("hybrid all_outputs has an unexpected shape.")
+    return final_output, h_n, all_outputs, gate_cache_all
+
+
+class A100GRUH256StackedFusedNaiveFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        h0: torch.Tensor,
+        num_layers: int,
+        backward_mode: int,
+        forward_mode: int,
+        *flat_params: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(flat_params) != num_layers * 4:
+            raise ValueError("flat_params must contain weight_ih, weight_hh, bias_ih, bias_hh per layer.")
+        layer_params = tuple(
+            (
+                flat_params[layer * 4],
+                flat_params[layer * 4 + 1],
+                flat_params[layer * 4 + 2],
+                flat_params[layer * 4 + 3],
+            )
+            for layer in range(num_layers)
+        )
+        if forward_mode == 2:
+            output, h_n, all_outputs, gate_cache_all = _a100_gru_h256_hybrid_k1_train_forward(
+                x,
+                h0,
+                layer_params,
+                block_threads=256,
+            )
+        else:
+            forward_kernel = (
+                a100_gru_h256_stacked_row4_k1_train_forward
+                if forward_mode == 1
+                else a100_gru_h256_stacked_row4_train_forward
+            )
+            output, h_n, all_outputs, gate_cache_all = forward_kernel(
+                x,
+                h0,
+                layer_params,
+                block_threads=256,
+            )
+        ctx.num_layers = num_layers
+        ctx.backward_mode = backward_mode
+        ctx.save_for_backward(x, h0, all_outputs, gate_cache_all, *flat_params)
+        return output, h_n
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: Optional[torch.Tensor],
+        grad_h_n: Optional[torch.Tensor],
+    ):
+        saved = ctx.saved_tensors
+        x = saved[0]
+        h0 = saved[1]
+        all_outputs = saved[2]
+        gate_cache_all = saved[3]
+        flat_params = saved[4:]
+        num_layers = ctx.num_layers
+        layer_params = tuple(
+            (
+                flat_params[layer * 4],
+                flat_params[layer * 4 + 1],
+                flat_params[layer * 4 + 2],
+                flat_params[layer * 4 + 3],
+            )
+            for layer in range(num_layers)
+        )
+        if grad_output is None:
+            grad_output = torch.zeros_like(all_outputs[-1])
+        if grad_h_n is None:
+            grad_h_n = torch.zeros_like(h0)
+
+        backward_kernel = (
+            a100_gru_h256_stacked_backward_split4
+            if ctx.backward_mode == 1
+            else a100_gru_h256_stacked_backward_split8
+            if ctx.backward_mode == 2
+            else a100_gru_h256_stacked_backward_split4_shmem
+            if ctx.backward_mode == 3
+            else a100_gru_h256_stacked_backward_split4_group8
+            if ctx.backward_mode == 4
+            else a100_gru_h256_stacked_backward_split6_weight_shmem
+            if ctx.backward_mode == 5
+            else a100_gru_h256_stacked_backward_naive
+        )
+        grad_x, grad_h0, grad_input_gates_all, grad_hidden_gates_all, _ = (
+            backward_kernel(
+                grad_output.contiguous(),
+                grad_h_n.contiguous(),
+                x,
+                h0,
+                layer_params,
+                all_outputs,
+                gate_cache_all,
+                block_threads=256,
+            )
+        )
+
+        param_grads: list[torch.Tensor] = []
+        batch_size, seq_len, _ = grad_output.shape
+        for layer, (weight_ih, weight_hh, bias_ih, bias_hh) in enumerate(layer_params):
+            del weight_ih, weight_hh, bias_ih, bias_hh
+            layer_input = x if layer == 0 else all_outputs[layer - 1]
+            hidden_prev = torch.cat(
+                (h0[layer].unsqueeze(1), all_outputs[layer, :, :-1, :]),
+                dim=1,
+            )
+            grad_input_gates = grad_input_gates_all[layer]
+            grad_hidden_gates = grad_hidden_gates_all[layer]
+            grad_input_2d = grad_input_gates.reshape(batch_size * seq_len, 3 * 256)
+            grad_hidden_2d = grad_hidden_gates.reshape(batch_size * seq_len, 3 * 256)
+            layer_input_2d = layer_input.reshape(batch_size * seq_len, layer_input.size(-1))
+            hidden_prev_2d = hidden_prev.reshape(batch_size * seq_len, 256)
+
+            grad_weight_ih = grad_input_2d.transpose(0, 1).matmul(layer_input_2d)
+            grad_weight_hh = grad_hidden_2d.transpose(0, 1).matmul(hidden_prev_2d)
+            grad_bias_ih = grad_input_2d.sum(dim=0)
+            grad_bias_hh = grad_hidden_2d.sum(dim=0)
+            param_grads.extend((grad_weight_ih, grad_weight_hh, grad_bias_ih, grad_bias_hh))
+
+        return (grad_x, grad_h0, None, None, None, *param_grads)
+
+
 class A100GRUH256(nn.Module):
     def __init__(
         self,
@@ -4163,6 +4739,8 @@ class A100GRUH256(nn.Module):
         hidden_size: int = 256,
         num_layers: int = 1,
         batch_first: bool = True,
+        bias: bool = True,
+        dropout: float = 0.0,
         block_threads: int = 704,
         use_recurrent_backward_kernel: bool = False,
         recompute_hidden_gates: bool = False,
@@ -4188,6 +4766,8 @@ class A100GRUH256(nn.Module):
         use_persistent_state16_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state5_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel: bool = False,
+        use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
         use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel: bool = False,
         use_persistent_state24_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel: bool = False,
@@ -4204,6 +4784,8 @@ class A100GRUH256(nn.Module):
         use_gate_cache_htile4_compact_hoist_qwarp_forward_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row3_forward_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row4_forward_kernel: bool = False,
+        use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel: bool = False,
+        use_gate_cache_htile8_compact_hoist_k1_forward_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel: bool = False,
         use_pack_hidden_prev_time_major_kernel: bool = False,
         use_gate_cache_htile4_compact_hoist_row4_parallel_update_forward_kernel: bool = False,
@@ -4217,15 +4799,23 @@ class A100GRUH256(nn.Module):
         super().__init__()
         if hidden_size != 256:
             raise ValueError("A100GRUH256 only supports hidden_size=256.")
-        if num_layers != 1:
-            raise ValueError("A100GRUH256 only supports num_layers=1.")
+        if not 1 <= input_size <= MAX_INPUT_SIZE:
+            raise ValueError("A100GRUH256 only supports 1 <= input_size <= 16.")
+        if not 1 <= num_layers <= MAX_NUM_LAYERS:
+            raise ValueError("A100GRUH256 only supports 1 <= num_layers <= 4.")
         if not batch_first:
             raise ValueError("A100GRUH256 only supports batch_first=True.")
+        if not bias:
+            raise ValueError("A100GRUH256 currently requires bias=True.")
+        if dropout != 0.0:
+            raise ValueError("A100GRUH256 currently requires dropout=0.")
 
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.batch_first = batch_first
+        self.bias = bias
+        self.dropout = float(dropout)
         self.block_threads = block_threads
         self.use_recurrent_backward_kernel = use_recurrent_backward_kernel
         self.recompute_hidden_gates = recompute_hidden_gates
@@ -4271,6 +4861,12 @@ class A100GRUH256(nn.Module):
         self.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
             use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
         )
+        self.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel = (
+            use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
+        )
+        self.use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
+            use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+        )
         self.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel = (
             use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
         )
@@ -4311,6 +4907,12 @@ class A100GRUH256(nn.Module):
         self.use_gate_cache_htile4_compact_hoist_row4_forward_kernel = (
             use_gate_cache_htile4_compact_hoist_row4_forward_kernel
         )
+        self.use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel = (
+            use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel
+        )
+        self.use_gate_cache_htile8_compact_hoist_k1_forward_kernel = (
+            use_gate_cache_htile8_compact_hoist_k1_forward_kernel
+        )
         self.use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel = (
             use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel
         )
@@ -4335,10 +4937,12 @@ class A100GRUH256(nn.Module):
         )
         self.use_persistent_state32_backward_kernel = use_persistent_state32_backward_kernel
 
-        self.weight_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size, input_size))
-        self.weight_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
-        self.bias_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size))
-        self.bias_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size))
+        for layer in range(num_layers):
+            layer_input_size = input_size if layer == 0 else hidden_size
+            setattr(self, f"weight_ih_l{layer}", nn.Parameter(torch.empty(3 * hidden_size, layer_input_size)))
+            setattr(self, f"weight_hh_l{layer}", nn.Parameter(torch.empty(3 * hidden_size, hidden_size)))
+            setattr(self, f"bias_ih_l{layer}", nn.Parameter(torch.empty(3 * hidden_size)))
+            setattr(self, f"bias_hh_l{layer}", nn.Parameter(torch.empty(3 * hidden_size)))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -4346,25 +4950,38 @@ class A100GRUH256(nn.Module):
         for weight in self.parameters():
             nn.init.uniform_(weight, -stdv, stdv)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        hx: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if hx is None:
-            h0 = x.new_zeros(x.size(0), self.hidden_size)
-        else:
-            if hx.shape != (1, x.size(0), self.hidden_size):
-                raise ValueError("hx must have shape [1, batch, 256].")
-            h0 = hx[0]
+    def _layer_parameters(self, layer: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            getattr(self, f"weight_ih_l{layer}"),
+            getattr(self, f"weight_hh_l{layer}"),
+            getattr(self, f"bias_ih_l{layer}"),
+            getattr(self, f"bias_hh_l{layer}"),
+        )
 
-        return a100_gru_h256(
-            x,
+    def _prepare_hx(self, x: torch.Tensor, hx: Optional[torch.Tensor]) -> torch.Tensor:
+        if hx is None:
+            return x.new_zeros(self.num_layers, x.size(0), self.hidden_size)
+        expected_shape = (self.num_layers, x.size(0), self.hidden_size)
+        if hx.shape != expected_shape:
+            raise ValueError(f"hx must have shape {expected_shape}.")
+        return hx
+
+    def _forward_train_layer(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+        output_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        runner = a100_gru_h256_output_only if output_only else a100_gru_h256
+        return runner(
+            layer_input,
             h0,
-            self.weight_ih_l0,
-            self.weight_hh_l0,
-            self.bias_ih_l0,
-            self.bias_hh_l0,
+            weight_ih,
+            weight_hh,
+            bias_ih,
+            bias_hh,
             block_threads=self.block_threads,
             use_recurrent_backward_kernel=self.use_recurrent_backward_kernel,
             recompute_hidden_gates=self.recompute_hidden_gates,
@@ -4412,6 +5029,12 @@ class A100GRUH256(nn.Module):
             use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
                 self.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             ),
+            use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel=(
+                self.use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel
+            ),
+            use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
+                self.use_persistent_state8_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
+            ),
             use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=(
                 self.use_persistent_state12_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel
             ),
@@ -4456,6 +5079,12 @@ class A100GRUH256(nn.Module):
             use_gate_cache_htile4_compact_hoist_row4_forward_kernel=(
                 self.use_gate_cache_htile4_compact_hoist_row4_forward_kernel
             ),
+            use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel=(
+                self.use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel
+            ),
+            use_gate_cache_htile8_compact_hoist_k1_forward_kernel=(
+                self.use_gate_cache_htile8_compact_hoist_k1_forward_kernel
+            ),
             use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel=(
                 self.use_gate_cache_htile4_compact_hoist_row4_prev_cache_forward_kernel
             ),
@@ -4485,21 +5114,737 @@ class A100GRUH256(nn.Module):
             ),
         )
 
+    def _forward_inference_layer(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+        output_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        with torch.no_grad():
+            layer_input = layer_input.contiguous()
+            h0 = h0.contiguous()
+            weight_ih = weight_ih.contiguous()
+            weight_hh = weight_hh.contiguous()
+            bias_ih = bias_ih.contiguous()
+            bias_hh = bias_hh.contiguous()
+            batch_size, seq_len, input_size = layer_input.shape
+            input_gates = F.linear(
+                layer_input.reshape(batch_size * seq_len, input_size),
+                weight_ih,
+                bias_ih,
+            ).view(batch_size, seq_len, 3 * self.hidden_size)
+            output = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_k1(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=256,
+            )
+            if output_only:
+                return output
+            h_n = output[:, -1, :].unsqueeze(0).contiguous()
+        return output, h_n
+
+    def _forward_inference_layer_ldg(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        with torch.no_grad():
+            layer_input = layer_input.contiguous()
+            h0 = h0.contiguous()
+            weight_ih = weight_ih.contiguous()
+            weight_hh = weight_hh.contiguous()
+            bias_ih = bias_ih.contiguous()
+            bias_hh = bias_hh.contiguous()
+            batch_size, seq_len, input_size = layer_input.shape
+            input_gates = F.linear(
+                layer_input.reshape(batch_size * seq_len, input_size),
+                weight_ih,
+                bias_ih,
+            ).view(batch_size, seq_len, 3 * self.hidden_size)
+            output = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_ldg(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=256,
+            )
+            h_n = output[:, -1, :].unsqueeze(0).contiguous()
+        return output, h_n
+
+    def _forward_inference_layer_k2(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        with torch.no_grad():
+            layer_input = layer_input.contiguous()
+            h0 = h0.contiguous()
+            weight_ih = weight_ih.contiguous()
+            weight_hh = weight_hh.contiguous()
+            bias_ih = bias_ih.contiguous()
+            bias_hh = bias_hh.contiguous()
+            batch_size, seq_len, input_size = layer_input.shape
+            input_gates = F.linear(
+                layer_input.reshape(batch_size * seq_len, input_size),
+                weight_ih,
+                bias_ih,
+            ).view(batch_size, seq_len, 3 * self.hidden_size)
+            output = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_k2(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=256,
+            )
+            h_n = output[:, -1, :].unsqueeze(0).contiguous()
+        return output, h_n
+
+    def _forward_inference_layer_k1(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        with torch.no_grad():
+            layer_input = layer_input.contiguous()
+            h0 = h0.contiguous()
+            weight_ih = weight_ih.contiguous()
+            weight_hh = weight_hh.contiguous()
+            bias_ih = bias_ih.contiguous()
+            bias_hh = bias_hh.contiguous()
+            batch_size, seq_len, input_size = layer_input.shape
+            input_gates = F.linear(
+                layer_input.reshape(batch_size * seq_len, input_size),
+                weight_ih,
+                bias_ih,
+            ).view(batch_size, seq_len, 3 * self.hidden_size)
+            output = a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_k1(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=256,
+            )
+            h_n = output[:, -1, :].unsqueeze(0).contiguous()
+        return output, h_n
+
+    def _forward_inference_layer_k1_htile8(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        with torch.no_grad():
+            layer_input = layer_input.contiguous()
+            h0 = h0.contiguous()
+            weight_ih = weight_ih.contiguous()
+            weight_hh = weight_hh.contiguous()
+            bias_ih = bias_ih.contiguous()
+            bias_hh = bias_hh.contiguous()
+            batch_size, seq_len, input_size = layer_input.shape
+            input_gates = F.linear(
+                layer_input.reshape(batch_size * seq_len, input_size),
+                weight_ih,
+                bias_ih,
+            ).view(batch_size, seq_len, 3 * self.hidden_size)
+            output = a100_gru_forward_from_gates_cooperative_h256_htile8_compact_hoist_k1_no_cache(
+                input_gates,
+                h0,
+                weight_hh,
+                bias_hh,
+                block_threads=256,
+            )
+            h_n = output[:, -1, :].unsqueeze(0).contiguous()
+        return output, h_n
+
+    def _forward_inference_k1_htile8(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output = x
+        h_n_parts = []
+        for layer in range(self.num_layers):
+            output, h_n = self._forward_inference_layer_k1_htile8(output, hx[layer], layer)
+            h_n_parts.append(h_n)
+        return output, torch.cat(h_n_parts, dim=0)
+
+    def _forward_train_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_train_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        output1, h1 = self._forward_train_layer(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_train_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        output1, h1 = self._forward_train_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_train_layer(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_train_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        output1, h1 = self._forward_train_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_train_layer(output1, hx[2], 2)
+        output3, h3 = self._forward_train_layer(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_train(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_train_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_train_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_train_3(x, hx)
+        return self._forward_train_4(x, hx)
+
+    def _forward_train_output_only_1(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        return self._forward_train_layer(x, hx[0], 0, output_only=True)
+
+    def _forward_train_output_only_2(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        output0 = self._forward_train_layer(x, hx[0], 0, output_only=True)
+        return self._forward_train_layer(output0, hx[1], 1, output_only=True)
+
+    def _forward_train_output_only_3(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        output0 = self._forward_train_layer(x, hx[0], 0, output_only=True)
+        output1 = self._forward_train_layer(output0, hx[1], 1, output_only=True)
+        return self._forward_train_layer(output1, hx[2], 2, output_only=True)
+
+    def _forward_train_output_only_4(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        output0 = self._forward_train_layer(x, hx[0], 0, output_only=True)
+        output1 = self._forward_train_layer(output0, hx[1], 1, output_only=True)
+        output2 = self._forward_train_layer(output1, hx[2], 2, output_only=True)
+        return self._forward_train_layer(output2, hx[3], 3, output_only=True)
+
+    def _forward_train_output_only(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        if self.num_layers == 1:
+            return self._forward_train_output_only_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_train_output_only_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_train_output_only_3(x, hx)
+        return self._forward_train_output_only_4(x, hx)
+
+    def _forward_inference_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_inference_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_inference_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_inference_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer(output1, hx[2], 2)
+        output3, h3 = self._forward_inference_layer(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_inference_ldg_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_ldg(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_inference_ldg_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_ldg(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_ldg(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_inference_ldg_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_ldg(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_ldg(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer_ldg(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_inference_ldg_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_ldg(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_ldg(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer_ldg(output1, hx[2], 2)
+        output3, h3 = self._forward_inference_layer_ldg(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_inference_ldg(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_inference_ldg_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_inference_ldg_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_inference_ldg_3(x, hx)
+        return self._forward_inference_ldg_4(x, hx)
+
+    def _forward_inference_k2_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k2(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_inference_k2_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k2(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_k2(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_inference_k2_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k2(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_k2(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer_k2(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_inference_k2_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k2(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_k2(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer_k2(output1, hx[2], 2)
+        output3, h3 = self._forward_inference_layer_k2(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_inference_k2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_inference_k2_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_inference_k2_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_inference_k2_3(x, hx)
+        return self._forward_inference_k2_4(x, hx)
+
+    def _forward_inference_k1_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k1(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_inference_k1_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k1(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_k1(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_inference_k1_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k1(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_k1(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer_k1(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_inference_k1_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer_k1(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer_k1(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer_k1(output1, hx[2], 2)
+        output3, h3 = self._forward_inference_layer_k1(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_inference_k1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_inference_k1_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_inference_k1_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_inference_k1_3(x, hx)
+        return self._forward_inference_k1_4(x, hx)
+
+    def _forward_inference(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_inference_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_inference_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_inference_3(x, hx)
+        return self._forward_inference_4(x, hx)
+
+    def _forward_inference_output_only_1(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        return self._forward_inference_layer(x, hx[0], 0, output_only=True)
+
+    def _forward_inference_output_only_2(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        output0 = self._forward_inference_layer(x, hx[0], 0, output_only=True)
+        return self._forward_inference_layer(output0, hx[1], 1, output_only=True)
+
+    def _forward_inference_output_only_3(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        output0 = self._forward_inference_layer(x, hx[0], 0, output_only=True)
+        output1 = self._forward_inference_layer(output0, hx[1], 1, output_only=True)
+        return self._forward_inference_layer(output1, hx[2], 2, output_only=True)
+
+    def _forward_inference_output_only_4(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        output0 = self._forward_inference_layer(x, hx[0], 0, output_only=True)
+        output1 = self._forward_inference_layer(output0, hx[1], 1, output_only=True)
+        output2 = self._forward_inference_layer(output1, hx[2], 2, output_only=True)
+        return self._forward_inference_layer(output2, hx[3], 3, output_only=True)
+
+    def _forward_inference_output_only(self, x: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        if self.num_layers == 1:
+            return self._forward_inference_output_only_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_inference_output_only_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_inference_output_only_3(x, hx)
+        return self._forward_inference_output_only_4(x, hx)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hx = self._prepare_hx(x, hx)
+        if not torch.is_grad_enabled():
+            return self._forward_inference(x, hx)
+        return self._forward_train(x, hx)
+
+    def forward_inference(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """显式运行不保存 backward gate cache 的推理路径。"""
+        hx = self._prepare_hx(x, hx)
+        return self._forward_inference(x, hx)
+
+    def forward_inference_ldg(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 no-cache 推理路径，对只读 input/weight/bias 使用 __ldg。"""
+        hx = self._prepare_hx(x, hx)
+        return self._forward_inference_ldg(x, hx)
+
+    def forward_inference_k2(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 no-cache 推理路径，把 recurrent K 维从 4 个 CTA 改为 2 个 CTA。"""
+        hx = self._prepare_hx(x, hx)
+        return self._forward_inference_k2(x, hx)
+
+    def forward_inference_k1(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 no-cache 推理路径，把 recurrent K 维压到单个 CTA。"""
+        hx = self._prepare_hx(x, hx)
+        return self._forward_inference_k1(x, hx)
+
+    def forward_inference_k1_htile8(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 htile8/K1 no-cache 推理路径，面向 batch=16 提高 CTA 数量。"""
+        hx = self._prepare_hx(x, hx)
+        return self._forward_inference_k1_htile8(x, hx)
+
+    def forward_inference_stacked_naive(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性多层 fused forward-only kernel，用于验证新的 layer 2/3/4 调度。"""
+        hx = self._prepare_hx(x, hx)
+        layer_params = tuple(
+            tuple(param.contiguous() for param in self._layer_parameters(layer))
+            for layer in range(self.num_layers)
+        )
+        with torch.no_grad():
+            return a100_gru_h256_stacked_forward_naive(
+                x.contiguous(),
+                hx.contiguous(),
+                layer_params,
+                block_threads=256,
+            )
+
+    def forward_inference_stacked_row4(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性多层 fused row4 forward-only kernel。"""
+        hx = self._prepare_hx(x, hx)
+        layer_params = tuple(
+            tuple(param.contiguous() for param in self._layer_parameters(layer))
+            for layer in range(self.num_layers)
+        )
+        with torch.no_grad():
+            return a100_gru_h256_stacked_row4_forward(
+                x.contiguous(),
+                hx.contiguous(),
+                layer_params,
+                block_threads=256,
+            )
+
+    def forward_train_stacked_row4_cache(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """实验性多层 fused 训练 forward，返回 output、h_n、all_outputs 和 gate cache。"""
+        hx = self._prepare_hx(x, hx)
+        layer_params = tuple(
+            tuple(param.contiguous() for param in self._layer_parameters(layer))
+            for layer in range(self.num_layers)
+        )
+        return a100_gru_h256_stacked_row4_train_forward(
+            x.contiguous(),
+            hx.contiguous(),
+            layer_params,
+            block_threads=256,
+        )
+
+    def forward_train_stacked_row4_k1_cache(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """实验性多层 fused K1 训练 forward，返回 output、h_n、all_outputs 和 gate cache。"""
+        hx = self._prepare_hx(x, hx)
+        layer_params = tuple(
+            tuple(param.contiguous() for param in self._layer_parameters(layer))
+            for layer in range(self.num_layers)
+        )
+        return a100_gru_h256_stacked_row4_k1_train_forward(
+            x.contiguous(),
+            hx.contiguous(),
+            layer_params,
+            block_threads=256,
+        )
+
+    def forward_train_stacked_fused_naive(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性多层 fused forward/backward 原型，当前只用于正确性和调度研究。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            0,
+            0,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split4(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性多层 fused forward/backward split4 路径，提升 fused backward 并行度。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            1,
+            0,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split8(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性多层 fused forward/backward split8 路径，继续提高 CTA 并行度。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            2,
+            0,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split4_shmem(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 fused split4 变体，用 shared memory 缓存本 CTA 的 gate 梯度。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            3,
+            0,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split4_k1_forward(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 fused 路径，K1 stacked forward + split4 backward。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            1,
+            1,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split4_group8(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 fused 路径，K1 stacked forward + split4/group8 backward。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            4,
+            1,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split6_weight_shmem(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 fused 路径，K1 forward + split6 weight-shmem backward。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            5,
+            1,
+            *flat_params,
+        )
+
+    def forward_train_stacked_fused_split6_hybrid_forward(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """实验性 fused 路径，cuBLAS input projection + K1 recurrent forward + split6 backward。"""
+        hx = self._prepare_hx(x, hx)
+        flat_params: list[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            flat_params.extend(self._layer_parameters(layer))
+        return A100GRUH256StackedFusedNaiveFunction.apply(
+            x.contiguous(),
+            hx.contiguous(),
+            self.num_layers,
+            5,
+            2,
+            *flat_params,
+        )
+
+    def forward_output_only(
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """显式运行只返回 output 的实验路径，适合调用方完全不使用 h_n 的训练。"""
+        hx = self._prepare_hx(x, hx)
+        if not torch.is_grad_enabled():
+            return self._forward_inference_output_only(x, hx)
+        return self._forward_train_output_only(x, hx)
+
+    @classmethod
+    def from_torch_gru(cls, gru: nn.GRU) -> A100GRUH256:
+        """从 torch.nn.GRU 创建同权重的实验 A100GRUH256。"""
+        return from_torch_gru(gru)
+
+
+def is_supported_gru(gru: nn.GRU) -> bool:
+    """判断 torch.nn.GRU 是否能无损替换为实验 A100 h256 实现。"""
+    if not isinstance(gru, nn.GRU) or not gru.bias:
+        return False
+    try:
+        first_param = next(gru.parameters())
+    except StopIteration:
+        return False
+    return (
+        1 <= gru.input_size <= MAX_INPUT_SIZE
+        and gru.hidden_size == 256
+        and 1 <= gru.num_layers <= MAX_NUM_LAYERS
+        and gru.batch_first
+        and not gru.bidirectional
+        and gru.dropout == 0.0
+        and first_param.dtype == torch.float32
+    )
+
+
+def from_torch_gru(gru: nn.GRU) -> A100GRUH256:
+    """从支持范围内的 torch.nn.GRU 创建当前实验最优组合。"""
+    if not is_supported_gru(gru):
+        raise ValueError(
+            "Only input_size<=16, 1-4 layer unidirectional batch_first fp32 GRU "
+            "with hidden_size=256, dropout=0 and bias=True is supported."
+        )
+    device = next(gru.parameters()).device
+    module = A100GRUH256(
+        input_size=gru.input_size,
+        num_layers=gru.num_layers,
+        dropout=gru.dropout,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_unroll8_backward_kernel=True,
+        use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel=True,
+        use_pack_hidden_prev_time_major_kernel=True,
+    ).to(device=device)
+    copy_from_torch_gru(module, gru)
+    return module
+
 
 def copy_from_torch_gru(a100_gru: A100GRUH256, torch_gru: nn.GRU) -> None:
     if torch_gru.bidirectional:
         raise ValueError("Bidirectional GRU is not supported.")
     if not torch_gru.batch_first:
         raise ValueError("Only batch_first=True GRU is supported.")
-    if torch_gru.num_layers != 1:
-        raise ValueError("Only num_layers=1 GRU is supported.")
+    if not torch_gru.bias:
+        raise ValueError("Only bias=True GRU is supported.")
+    if torch_gru.dropout != 0.0:
+        raise ValueError("Only dropout=0 GRU is supported.")
+    if not 1 <= torch_gru.num_layers <= MAX_NUM_LAYERS:
+        raise ValueError("Only 1 <= num_layers <= 4 GRU is supported.")
+    if torch_gru.num_layers != a100_gru.num_layers:
+        raise ValueError("num_layers mismatch.")
     if torch_gru.hidden_size != 256:
         raise ValueError("Only hidden_size=256 GRU is supported.")
+    if not 1 <= torch_gru.input_size <= MAX_INPUT_SIZE:
+        raise ValueError("Only 1 <= input_size <= 16 GRU is supported.")
     if torch_gru.input_size != a100_gru.input_size:
         raise ValueError("input_size mismatch.")
 
     with torch.no_grad():
-        a100_gru.weight_ih_l0.copy_(torch_gru.weight_ih_l0)
-        a100_gru.weight_hh_l0.copy_(torch_gru.weight_hh_l0)
-        a100_gru.bias_ih_l0.copy_(torch_gru.bias_ih_l0)
-        a100_gru.bias_hh_l0.copy_(torch_gru.bias_hh_l0)
+        for layer in range(torch_gru.num_layers):
+            getattr(a100_gru, f"weight_ih_l{layer}").copy_(getattr(torch_gru, f"weight_ih_l{layer}"))
+            getattr(a100_gru, f"weight_hh_l{layer}").copy_(getattr(torch_gru, f"weight_hh_l{layer}"))
+            getattr(a100_gru, f"bias_ih_l{layer}").copy_(getattr(torch_gru, f"bias_ih_l{layer}"))
+            getattr(a100_gru, f"bias_hh_l{layer}").copy_(getattr(torch_gru, f"bias_hh_l{layer}"))

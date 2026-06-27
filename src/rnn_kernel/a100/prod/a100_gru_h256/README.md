@@ -1,7 +1,7 @@
 # A100GRUH256 独立库
 
-这是一个可直接复制走的 A100/SM80 专用 GRU 库，固定支持 `hidden_size=256`、fp32、
-单层、单向、`batch_first=True` 的训练场景。
+这是一个可直接复制走的 A100/SM80 专用 GRU 库，固定支持 `input_size=1..16`、
+`hidden_size=256`、fp32、`num_layers=1..4`、单向、`batch_first=True` 的训练场景。
 
 ## 目录内容
 
@@ -35,6 +35,28 @@ python -m pip install -r a100_gru_h256/requirements-runtime.txt
 
 如果目标机没有 CUDA 版 PyTorch，请先按该机器的 CUDA/驱动环境安装 CUDA 版 PyTorch；
 不要误装 CPU-only PyTorch。
+
+## 当前实现
+
+该包同步的是当前最优非 fused 训练/推理路径：
+
+- 训练 forward：逐层 `htile4 compact hoist row4 K1 gate-cache`
+- 推理 forward：逐层 `htile4 compact hoist row4 K1 no-cache`
+- backward：逐层 `split6 persistent-state gate-cache tiled weight-shmem split0-keep unroll8`
+- 布局准备：`hidden-prev pack`
+- block threads：`256`
+
+真正 fused 多层 kernel 仍属于实验区内容，当前没有进入该 prod 包默认路径。
+
+A100 80GB、`batch=16`、`seq=512`、`input_size=16`、`hidden_size=256`、fp32、
+TF32 关闭下，训练 forward+backward、不含 optimizer 的参考性能：
+
+| 层数 | torch.nn.GRU/cuDNN | A100GRUH256 | 加速 |
+| --- | ---: | ---: | ---: |
+| 1 | 19.775 ms | 5.753 ms | 3.44x |
+| 2 | 32.121 ms | 11.895 ms | 2.70x |
+| 3 | 42.427 ms | 18.156 ms | 2.34x |
+| 4 | 62.878 ms | 24.334 ms | 2.58x |
 
 ## 压缩目录分发
 
@@ -127,7 +149,7 @@ from a100_gru_h256 import A100GRUH256, from_torch_gru
 ```python
 from a100_gru_h256 import A100GRUH256, from_torch_gru
 
-fast_gru = A100GRUH256(input_size=5).cuda()
+fast_gru = A100GRUH256(input_size=16, num_layers=2).cuda()
 
 # 或者从 torch.nn.GRU 复制权重
 fast_gru = from_torch_gru(torch_gru)
@@ -159,11 +181,13 @@ python a100_gru_h256/scripts/benchmark.py --timed-steps 10 --include-inference
 ## 支持范围
 
 - `hidden_size=256`
+- `input_size=1..16`
 - `dtype=torch.float32`
 - `batch_first=True`
-- `num_layers=1`
+- `num_layers=1..4`
 - 单向 GRU
 - `bias=True`
+- `dropout=0.0`
 - A100/SM80
 
 不满足上述条件时应回退到 `torch.nn.GRU`。

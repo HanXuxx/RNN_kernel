@@ -20,18 +20,20 @@ except ImportError:  # pragma: no cover - 运行时给出更清晰错误。
 
 BEST_BLOCK_THREADS = 256
 HIDDEN_SIZE = 256
+MAX_NUM_LAYERS = 4
+MAX_INPUT_SIZE = 16
 _CUBIN_PACKAGE = "a100_gru_h256.kernels"
 _CUBIN_NAME = "a100_gru_h256_sm80.cubin"
 _SOURCE_TREE_CUBIN_PATH = Path(__file__).resolve().parent / "kernels" / _CUBIN_NAME
 
 _FORWARD_KERNEL_NAME = (
-    b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_shmem_gate_cache_kernel"
+    b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_k1_shmem_gate_cache_kernel"
 )
 _FORWARD_INFERENCE_KERNEL_NAME = (
-    b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_kernel"
+    b"a100_gru_forward_from_gates_cooperative_h256_htile4_compact_hoist_row4_no_cache_k1_kernel"
 )
 _BACKWARD_KERNEL_NAME = (
-    b"a100_gru_h256_backward_sequence_cooperative_split6_gate_cache_state_tiled_weight_shmem_split0_keep_kernel"
+    b"a100_gru_h256_backward_sequence_cooperative_split6_gate_cache_state_tiled_weight_shmem_split0_keep_unroll8_kernel"
 )
 _PACK_KERNEL_NAME = b"a100_gru_h256_pack_hidden_prev_time_major_kernel"
 
@@ -124,11 +126,12 @@ def is_supported_gru(gru: nn.GRU) -> bool:
     except StopIteration:
         return False
     return (
-        gru.input_size > 0
+        1 <= gru.input_size <= MAX_INPUT_SIZE
         and gru.hidden_size == HIDDEN_SIZE
-        and gru.num_layers == 1
+        and 1 <= gru.num_layers <= MAX_NUM_LAYERS
         and gru.batch_first
         and not gru.bidirectional
+        and gru.dropout == 0.0
         and first_param.dtype == torch.float32
     )
 
@@ -229,8 +232,8 @@ def _launch_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, seq_len, hidden3 = input_gates.shape
     hidden_tile = HIDDEN_SIZE // 4
-    ctas_per_batch = 16
-    compact_partials_per_batch = 12
+    ctas_per_batch = 4
+    compact_partials_per_batch = 1
     output = torch.empty(batch_size, seq_len, HIDDEN_SIZE, device=input_gates.device, dtype=input_gates.dtype)
     gate_cache = torch.empty(batch_size, seq_len, 4 * HIDDEN_SIZE, device=input_gates.device, dtype=input_gates.dtype)
     partial_gates = torch.empty(
@@ -307,8 +310,8 @@ def _launch_forward_no_cache(
 ) -> torch.Tensor:
     batch_size, seq_len, hidden3 = input_gates.shape
     hidden_tile = HIDDEN_SIZE // 4
-    ctas_per_batch = 16
-    compact_partials_per_batch = 12
+    ctas_per_batch = 4
+    compact_partials_per_batch = 1
     output = torch.empty(batch_size, seq_len, HIDDEN_SIZE, device=input_gates.device, dtype=input_gates.dtype)
     partial_gates = torch.empty(
         batch_size * compact_partials_per_batch,
@@ -624,26 +627,34 @@ class A100GRU(nn.Module):
         num_layers: int = 1,
         batch_first: bool = True,
         bias: bool = True,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if hidden_size != HIDDEN_SIZE:
             raise ValueError("A100GRU only supports hidden_size=256.")
-        if num_layers != 1:
-            raise ValueError("A100GRU only supports num_layers=1.")
+        if not 1 <= input_size <= MAX_INPUT_SIZE:
+            raise ValueError("A100GRU only supports 1 <= input_size <= 16.")
+        if not 1 <= num_layers <= MAX_NUM_LAYERS:
+            raise ValueError("A100GRU only supports 1 <= num_layers <= 4.")
         if not batch_first:
             raise ValueError("A100GRU only supports batch_first=True.")
         if not bias:
             raise ValueError("A100GRU currently requires bias=True.")
+        if dropout != 0.0:
+            raise ValueError("A100GRU currently requires dropout=0.")
 
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.batch_first = batch_first
         self.bias = bias
-        self.weight_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size, input_size))
-        self.weight_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
-        self.bias_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size))
-        self.bias_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size))
+        self.dropout = float(dropout)
+        for layer in range(num_layers):
+            layer_input_size = input_size if layer == 0 else hidden_size
+            setattr(self, f"weight_ih_l{layer}", nn.Parameter(torch.empty(3 * hidden_size, layer_input_size)))
+            setattr(self, f"weight_hh_l{layer}", nn.Parameter(torch.empty(3 * hidden_size, hidden_size)))
+            setattr(self, f"bias_ih_l{layer}", nn.Parameter(torch.empty(3 * hidden_size)))
+            setattr(self, f"bias_hh_l{layer}", nn.Parameter(torch.empty(3 * hidden_size)))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -651,34 +662,111 @@ class A100GRU(nn.Module):
         for weight in self.parameters():
             nn.init.uniform_(weight, -stdv, stdv)
 
+    def _layer_parameters(self, layer: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            getattr(self, f"weight_ih_l{layer}"),
+            getattr(self, f"weight_hh_l{layer}"),
+            getattr(self, f"bias_ih_l{layer}"),
+            getattr(self, f"bias_hh_l{layer}"),
+        )
+
+    def _prepare_hx(self, x: torch.Tensor, hx: Optional[torch.Tensor]) -> torch.Tensor:
+        if hx is None:
+            return x.new_zeros(self.num_layers, x.size(0), self.hidden_size)
+        expected_shape = (self.num_layers, x.size(0), self.hidden_size)
+        if hx.shape != expected_shape:
+            raise ValueError(f"hx must have shape {expected_shape}.")
+        return hx
+
+    def _forward_train_layer(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        return _A100GRUFunction.apply(layer_input, h0, weight_ih, weight_hh, bias_ih, bias_hh)
+
+    def _forward_inference_layer(
+        self,
+        layer_input: torch.Tensor,
+        h0: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_ih, weight_hh, bias_ih, bias_hh = self._layer_parameters(layer)
+        return _a100_gru_forward_inference(layer_input, h0, weight_ih, weight_hh, bias_ih, bias_hh)
+
+    def _forward_train_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_train_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        output1, h1 = self._forward_train_layer(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_train_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        output1, h1 = self._forward_train_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_train_layer(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_train_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_train_layer(x, hx[0], 0)
+        output1, h1 = self._forward_train_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_train_layer(output1, hx[2], 2)
+        output3, h3 = self._forward_train_layer(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_train(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_train_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_train_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_train_3(x, hx)
+        return self._forward_train_4(x, hx)
+
+    def _forward_inference_1(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        return output0, h0
+
+    def _forward_inference_2(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer(output0, hx[1], 1)
+        return output1, torch.cat((h0, h1), dim=0)
+
+    def _forward_inference_3(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer(output1, hx[2], 2)
+        return output2, torch.cat((h0, h1, h2), dim=0)
+
+    def _forward_inference_4(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output0, h0 = self._forward_inference_layer(x, hx[0], 0)
+        output1, h1 = self._forward_inference_layer(output0, hx[1], 1)
+        output2, h2 = self._forward_inference_layer(output1, hx[2], 2)
+        output3, h3 = self._forward_inference_layer(output2, hx[3], 3)
+        return output3, torch.cat((h0, h1, h2, h3), dim=0)
+
+    def _forward_inference(self, x: torch.Tensor, hx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_layers == 1:
+            return self._forward_inference_1(x, hx)
+        if self.num_layers == 2:
+            return self._forward_inference_2(x, hx)
+        if self.num_layers == 3:
+            return self._forward_inference_3(x, hx)
+        return self._forward_inference_4(x, hx)
+
     def forward(
         self,
         x: torch.Tensor,
         hx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if hx is None:
-            h0 = x.new_zeros(x.size(0), self.hidden_size)
-        else:
-            if hx.shape != (1, x.size(0), self.hidden_size):
-                raise ValueError("hx must have shape [1, batch, 256].")
-            h0 = hx[0]
+        hx = self._prepare_hx(x, hx)
         if not torch.is_grad_enabled():
-            return _a100_gru_forward_inference(
-                x,
-                h0,
-                self.weight_ih_l0,
-                self.weight_hh_l0,
-                self.bias_ih_l0,
-                self.bias_hh_l0,
-            )
-        return _A100GRUFunction.apply(
-            x,
-            h0,
-            self.weight_ih_l0,
-            self.weight_hh_l0,
-            self.bias_ih_l0,
-            self.bias_hh_l0,
-        )
+            return self._forward_inference(x, hx)
+        return self._forward_train(x, hx)
 
     def forward_inference(
         self,
@@ -686,20 +774,8 @@ class A100GRU(nn.Module):
         hx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """显式运行 forward-only no-cache 推理路径。"""
-        if hx is None:
-            h0 = x.new_zeros(x.size(0), self.hidden_size)
-        else:
-            if hx.shape != (1, x.size(0), self.hidden_size):
-                raise ValueError("hx must have shape [1, batch, 256].")
-            h0 = hx[0]
-        return _a100_gru_forward_inference(
-            x,
-            h0,
-            self.weight_ih_l0,
-            self.weight_hh_l0,
-            self.bias_ih_l0,
-            self.bias_hh_l0,
-        )
+        hx = self._prepare_hx(x, hx)
+        return self._forward_inference(x, hx)
 
     @classmethod
     def from_torch_gru(cls, gru: nn.GRU) -> A100GRU:
@@ -714,14 +790,19 @@ def from_torch_gru(gru: nn.GRU) -> A100GRU:
     """从支持范围内的 torch.nn.GRU 创建生产试用封装。"""
     if not is_supported_gru(gru):
         raise ValueError(
-            "Only single-layer unidirectional batch_first fp32 GRU with hidden_size=256 "
-            "and bias=True is supported."
+            "Only input_size<=16, 1-4 layer unidirectional batch_first fp32 GRU "
+            "with hidden_size=256, dropout=0 and bias=True is supported."
         )
     device = next(gru.parameters()).device
-    module = A100GRU(input_size=gru.input_size).to(device=device)
+    module = A100GRU(
+        input_size=gru.input_size,
+        num_layers=gru.num_layers,
+        dropout=gru.dropout,
+    ).to(device=device)
     with torch.no_grad():
-        module.weight_ih_l0.copy_(gru.weight_ih_l0)
-        module.weight_hh_l0.copy_(gru.weight_hh_l0)
-        module.bias_ih_l0.copy_(gru.bias_ih_l0)
-        module.bias_hh_l0.copy_(gru.bias_hh_l0)
+        for layer in range(gru.num_layers):
+            getattr(module, f"weight_ih_l{layer}").copy_(getattr(gru, f"weight_ih_l{layer}"))
+            getattr(module, f"weight_hh_l{layer}").copy_(getattr(gru, f"weight_hh_l{layer}"))
+            getattr(module, f"bias_ih_l{layer}").copy_(getattr(gru, f"bias_ih_l{layer}"))
+            getattr(module, f"bias_hh_l{layer}").copy_(getattr(gru, f"bias_hh_l{layer}"))
     return module

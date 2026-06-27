@@ -46,8 +46,8 @@ def main() -> None:
 
     args = parse_args()
     if args.run_smoke:
-        model = A100GRUH256(input_size=5).cuda()
-        x = torch.randn(2, 5, 5, device="cuda", requires_grad=True)
+        model = A100GRUH256(input_size=16).cuda()
+        x = torch.randn(2, 5, 16, device="cuda", requires_grad=True)
         output, h_n = model(x)
         (output.sum() + h_n.sum()).backward()
         torch.cuda.synchronize()

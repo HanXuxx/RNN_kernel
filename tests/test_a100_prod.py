@@ -22,8 +22,27 @@ def test_prod_a100_gru_rejects_unsupported_torch_gru() -> None:
     assert not is_supported_gru(gru)
     with pytest.raises(ValueError, match="hidden_size=256"):
         A100GRU(input_size=5, hidden_size=128)
-    with pytest.raises(ValueError, match="Only single-layer"):
+    with pytest.raises(ValueError, match="1-4 layer"):
         from_torch_gru(gru)
+    with pytest.raises(ValueError, match="1 <= num_layers <= 4"):
+        A100GRU(input_size=5, num_layers=5)
+    with pytest.raises(ValueError, match="1 <= input_size <= 16"):
+        A100GRU(input_size=17)
+
+    unsupported_input_size = torch.nn.GRU(17, 256, num_layers=1, batch_first=True)
+    assert not is_supported_gru(unsupported_input_size)
+    with pytest.raises(ValueError, match="input_size<=16"):
+        from_torch_gru(unsupported_input_size)
+
+    unsupported_layers = torch.nn.GRU(5, 256, num_layers=5, batch_first=True)
+    assert not is_supported_gru(unsupported_layers)
+    with pytest.raises(ValueError, match="1-4 layer"):
+        from_torch_gru(unsupported_layers)
+
+    unsupported_dropout = torch.nn.GRU(5, 256, num_layers=2, dropout=0.1, batch_first=True)
+    assert not is_supported_gru(unsupported_dropout)
+    with pytest.raises(ValueError, match="1-4 layer"):
+        from_torch_gru(unsupported_dropout)
 
 
 def test_prod_is_a100_available_accepts_cpu_device() -> None:
@@ -62,11 +81,15 @@ print(json.dumps({
     }
 
 
-def test_prod_a100_gru_from_torch_gru_matches_torch_gru() -> None:
+@pytest.mark.parametrize("input_size", [1, 16])
+@pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
+def test_prod_a100_gru_from_torch_gru_matches_torch_gru(
+    num_layers: int,
+    input_size: int,
+) -> None:
     _requires_a100()
-    torch.manual_seed(2130)
+    torch.manual_seed(2130 + num_layers * 10 + input_size)
     device = torch.device("cuda")
-    input_size = 5
     hidden_size = 256
     batch_size = 2
     seq_len = 5
@@ -74,14 +97,14 @@ def test_prod_a100_gru_from_torch_gru_matches_torch_gru() -> None:
     torch_gru = torch.nn.GRU(
         input_size=input_size,
         hidden_size=hidden_size,
-        num_layers=1,
+        num_layers=num_layers,
         batch_first=True,
     ).to(device)
     a100_gru = from_torch_gru(torch_gru)
 
     x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
     x_a100 = x_torch.detach().clone().requires_grad_(True)
-    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_torch = torch.randn(num_layers, batch_size, hidden_size, device=device, requires_grad=True)
     h0_a100 = h0_torch.detach().clone().requires_grad_(True)
 
     torch_out, torch_h = torch_gru(x_torch, h0_torch)
@@ -103,11 +126,15 @@ def test_prod_a100_gru_from_torch_gru_matches_torch_gru() -> None:
         assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
 
 
-def test_prod_a100_gru_forward_inference_matches_torch_gru() -> None:
+@pytest.mark.parametrize("input_size", [1, 16])
+@pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
+def test_prod_a100_gru_forward_inference_matches_torch_gru(
+    num_layers: int,
+    input_size: int,
+) -> None:
     _requires_a100()
-    torch.manual_seed(2133)
+    torch.manual_seed(2133 + num_layers * 10 + input_size)
     device = torch.device("cuda")
-    input_size = 5
     hidden_size = 256
     batch_size = 2
     seq_len = 5
@@ -115,12 +142,12 @@ def test_prod_a100_gru_forward_inference_matches_torch_gru() -> None:
     torch_gru = torch.nn.GRU(
         input_size=input_size,
         hidden_size=hidden_size,
-        num_layers=1,
+        num_layers=num_layers,
         batch_first=True,
     ).to(device)
     a100_gru = from_torch_gru(torch_gru)
     x = torch.randn(batch_size, seq_len, input_size, device=device)
-    h0 = torch.randn(1, batch_size, hidden_size, device=device)
+    h0 = torch.randn(num_layers, batch_size, hidden_size, device=device)
 
     with torch.no_grad():
         torch_out, torch_h = torch_gru(x, h0)

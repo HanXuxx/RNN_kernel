@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from rnn_kernel.a100 import A100GRUH256, copy_from_torch_gru
+from rnn_kernel.a100 import (
+    A100GRUH256,
+    copy_from_torch_gru,
+    from_torch_gru,
+    is_supported_gru,
+)
 from rnn_kernel.a100.gru_autograd import (
     _a100_gru_h256_backward_step,
     _a100_gru_h256_backward_step_cooperative_split,
@@ -71,6 +76,292 @@ def test_a100_gru_h256_autograd_matches_torch_gru() -> None:
 def test_a100_gru_h256_rejects_non_h256() -> None:
     with pytest.raises(ValueError, match="hidden_size=256"):
         A100GRUH256(input_size=5, hidden_size=128)
+
+
+def test_a100_gru_h256_rejects_unsupported_multilayer_settings() -> None:
+    with pytest.raises(ValueError, match="1 <= input_size <= 16"):
+        A100GRUH256(input_size=17)
+    with pytest.raises(ValueError, match="1 <= num_layers <= 4"):
+        A100GRUH256(input_size=5, num_layers=5)
+    with pytest.raises(ValueError, match="dropout=0"):
+        A100GRUH256(input_size=5, num_layers=2, dropout=0.1)
+
+    unsupported_input_size = torch.nn.GRU(17, 256, num_layers=1, batch_first=True)
+    assert not is_supported_gru(unsupported_input_size)
+    with pytest.raises(ValueError, match="input_size<=16"):
+        from_torch_gru(unsupported_input_size)
+
+    unsupported_layers = torch.nn.GRU(5, 256, num_layers=5, batch_first=True)
+    assert not is_supported_gru(unsupported_layers)
+    with pytest.raises(ValueError, match="1-4 layer"):
+        from_torch_gru(unsupported_layers)
+
+    unsupported_dropout = torch.nn.GRU(5, 256, num_layers=2, dropout=0.1, batch_first=True)
+    assert not is_supported_gru(unsupported_dropout)
+    with pytest.raises(ValueError, match="1-4 layer"):
+        from_torch_gru(unsupported_dropout)
+
+
+@pytest.mark.parametrize("input_size", [1, 16])
+@pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
+def test_a100_gru_h256_multilayer_autograd_matches_torch_gru(
+    num_layers: int,
+    input_size: int,
+) -> None:
+    _requires_a100()
+    torch.manual_seed(2160 + num_layers * 10 + input_size)
+    device = torch.device("cuda")
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+    ).to(device)
+    a100_gru = from_torch_gru(torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(num_layers, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("input_size", [1, 16])
+@pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
+def test_a100_gru_h256_multilayer_forward_inference_matches_torch_gru(
+    num_layers: int,
+    input_size: int,
+) -> None:
+    _requires_a100()
+    torch.manual_seed(2170 + num_layers * 10 + input_size)
+    device = torch.device("cuda")
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+    ).to(device)
+    a100_gru = from_torch_gru(torch_gru)
+    x = torch.randn(batch_size, seq_len, input_size, device=device)
+    h0 = torch.randn(num_layers, batch_size, hidden_size, device=device)
+
+    with torch.no_grad():
+        torch_out, torch_h = torch_gru(x, h0)
+        no_grad_out, no_grad_h = a100_gru(x, h0)
+        explicit_out, explicit_h = a100_gru.forward_inference(x, h0)
+        k1_out, k1_h = a100_gru.forward_inference_k1(x, h0)
+        k1_htile8_out, k1_htile8_h = a100_gru.forward_inference_k1_htile8(x, h0)
+        k2_out, k2_h = a100_gru.forward_inference_k2(x, h0)
+
+    assert not no_grad_out.requires_grad
+    assert not explicit_out.requires_grad
+    assert torch.allclose(torch_out, no_grad_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, no_grad_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_out, explicit_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, explicit_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_out, k1_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, k1_h, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_out, k1_htile8_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, k1_htile8_h, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_out, k2_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, k2_h, atol=8e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("num_layers", [2, 3, 4])
+def test_a100_gru_h256_forward_output_only_matches_torch_gru(num_layers: int) -> None:
+    _requires_a100()
+    torch.manual_seed(2180 + num_layers)
+    device = torch.device("cuda")
+    input_size = 16
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+    ).to(device)
+    a100_gru = from_torch_gru(torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(num_layers, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, _ = torch_gru(x_torch, h0_torch)
+    a100_out = a100_gru.forward_output_only(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    torch_out.backward(grad_out)
+    a100_out.backward(grad_out)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("num_layers", [2, 3, 4])
+def test_a100_gru_h256_stacked_naive_forward_inference_matches_torch_gru(
+    num_layers: int,
+) -> None:
+    _requires_a100()
+    torch.manual_seed(2190 + num_layers)
+    device = torch.device("cuda")
+    input_size = 16
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+    ).to(device)
+    a100_gru = from_torch_gru(torch_gru)
+    x = torch.randn(batch_size, seq_len, input_size, device=device)
+    h0 = torch.randn(num_layers, batch_size, hidden_size, device=device)
+
+    with torch.no_grad():
+        torch_out, torch_h = torch_gru(x, h0)
+        a100_out, a100_h = a100_gru.forward_inference(x, h0)
+        stacked_out, stacked_h = a100_gru.forward_inference_stacked_naive(x, h0)
+        row4_out, row4_h = a100_gru.forward_inference_stacked_row4(x, h0)
+        k1_train_out, k1_train_h, _, _ = a100_gru.forward_train_stacked_row4_k1_cache(x, h0)
+
+    assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(torch_out, stacked_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, stacked_h, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_out, row4_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, row4_h, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_out, k1_train_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, k1_train_h, atol=8e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("num_layers", [2, 3, 4])
+@pytest.mark.parametrize(
+    "backward_name",
+    [
+        "naive",
+        "split4",
+        "split4_k1_forward",
+        "split4_group8",
+        "split4_shmem",
+        "split6_hybrid_forward",
+        "split6_weight_shmem",
+        "split8",
+    ],
+)
+def test_a100_gru_h256_stacked_fused_autograd_matches_torch_gru(
+    num_layers: int,
+    backward_name: str,
+) -> None:
+    _requires_a100()
+    torch.manual_seed(2195 + num_layers)
+    device = torch.device("cuda")
+    input_size = 16
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+    ).to(device)
+    a100_gru = from_torch_gru(torch_gru)
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    h0_torch = torch.randn(
+        num_layers,
+        batch_size,
+        hidden_size,
+        device=device,
+        requires_grad=True,
+    )
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(batch_size, seq_len, hidden_size, device=device)
+    grad_h = torch.randn(num_layers, batch_size, hidden_size, device=device)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    if backward_name == "split8":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split8(x_a100, h0_a100)
+    elif backward_name == "split6_weight_shmem":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split6_weight_shmem(
+            x_a100,
+            h0_a100,
+        )
+    elif backward_name == "split6_hybrid_forward":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split6_hybrid_forward(
+            x_a100,
+            h0_a100,
+        )
+    elif backward_name == "split4_group8":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split4_group8(
+            x_a100,
+            h0_a100,
+        )
+    elif backward_name == "split4_k1_forward":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split4_k1_forward(
+            x_a100,
+            h0_a100,
+        )
+    elif backward_name == "split4_shmem":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split4_shmem(
+            x_a100,
+            h0_a100,
+        )
+    elif backward_name == "split4":
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_split4(x_a100, h0_a100)
+    else:
+        a100_out, a100_h = a100_gru.forward_train_stacked_fused_naive(x_a100, h0_a100)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, a100_h, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=2e-3, rtol=2e-3)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=2e-3, rtol=2e-3)
+    a100_params = dict(a100_gru.named_parameters())
+    for name, torch_param in torch_gru.named_parameters():
+        assert torch.allclose(
+            torch_param.grad,
+            a100_params[name].grad,
+            atol=3e-3,
+            rtol=3e-3,
+        )
 
 
 def test_a100_gru_h256_pack_hidden_prev_time_major_matches_torch_layout() -> None:
@@ -1912,6 +2203,53 @@ def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_ke
 
     assert torch.allclose(torch_out, a100_out, atol=4e-4, rtol=1e-4)
     assert torch.allclose(torch_h, a100_h, atol=4e-4, rtol=1e-4)
+    assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
+    assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
+
+    for name, torch_param in torch_gru.named_parameters():
+        a100_param = getattr(a100_gru, name)
+        assert torch.allclose(torch_param.grad, a100_param.grad, atol=5e-3, rtol=1e-3)
+
+
+def test_a100_gru_h256_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_htile8_compact_hoist_k1_autograd_matches_torch_gru() -> None:
+    _requires_a100()
+    torch.manual_seed(2113)
+    device = torch.device("cuda")
+    input_size = 16
+    hidden_size = 256
+    batch_size = 2
+    seq_len = 5
+
+    torch_gru = torch.nn.GRU(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=1,
+        batch_first=True,
+    ).to(device)
+    a100_gru = A100GRUH256(
+        input_size=input_size,
+        block_threads=256,
+        use_persistent_state6_gate_cache_tiled_weight_shmem_split0_keep_backward_kernel=True,
+        use_gate_cache_htile8_compact_hoist_k1_forward_kernel=True,
+    ).to(device)
+    copy_from_torch_gru(a100_gru, torch_gru)
+
+    x_torch = torch.randn(batch_size, seq_len, input_size, device=device, requires_grad=True)
+    x_a100 = x_torch.detach().clone().requires_grad_(True)
+    h0_torch = torch.randn(1, batch_size, hidden_size, device=device, requires_grad=True)
+    h0_a100 = h0_torch.detach().clone().requires_grad_(True)
+
+    torch_out, torch_h = torch_gru(x_torch, h0_torch)
+    a100_out, a100_h = a100_gru(x_a100, h0_a100)
+    grad_out = torch.randn_like(torch_out)
+    grad_h = torch.randn_like(torch_h)
+    torch_out.backward(grad_out, retain_graph=True)
+    torch_h.backward(grad_h)
+    a100_out.backward(grad_out, retain_graph=True)
+    a100_h.backward(grad_h)
+
+    assert torch.allclose(torch_out, a100_out, atol=8e-4, rtol=2e-4)
+    assert torch.allclose(torch_h, a100_h, atol=8e-4, rtol=2e-4)
     assert torch.allclose(x_torch.grad, x_a100.grad, atol=1e-3, rtol=3e-4)
     assert torch.allclose(h0_torch.grad, h0_a100.grad, atol=1e-3, rtol=3e-4)
 

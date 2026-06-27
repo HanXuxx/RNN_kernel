@@ -5,12 +5,14 @@
 必须满足：
 
 - GPU compute capability 为 `sm_80`
+- GRU input size 为 `1..16`
 - GRU hidden size 为 `256`
 - fp32
-- 单层
+- `num_layers=1..4`
 - 单向
 - `batch_first=True`
 - `bias=True`
+- `dropout=0.0`
 
 建议外部模块在替换前使用：
 

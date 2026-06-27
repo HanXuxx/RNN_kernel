@@ -55,6 +55,12 @@ _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION = (
 _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION = (
     "a100_gru_h256_coop_split6_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4"
 )
+_A100_HTILE4_COMPACT_HOIST_ROW4_K1_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split6_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_k1"
+)
+_A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION = (
+    "a100_gru_h256_coop_split6_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_output_only"
+)
 _A100_HTILE4_COMPACT_HOIST_ROW4_LDG_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION = (
     "a100_gru_h256_coop_split6_persistent_state_gate_cache_tiled_weight_shmem_split0_keep_htile4_compact_hoist_row4_ldg"
 )
@@ -116,6 +122,8 @@ def resolve_a100_block_threads(implementation: str, a100_block_threads: int) -> 
         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_K1_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION,
         _A100_HTILE4_COMPACT_HOIST_ROW4_LDG_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT5_SPLIT0_KEEP_IMPLEMENTATION,
         _A100_HTILE4_COMPACT_HOIST_ROW4_PARALLEL_UPDATE_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
@@ -179,6 +187,10 @@ class RNNBenchmarkModel(nn.Module):
         super().__init__()
         self.sequence_chunk_len = sequence_chunk_len
         self.implementation = implementation
+        self.use_a100_output_only = (
+            implementation
+            == _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION
+        )
         effective_a100_block_threads = resolve_a100_block_threads(
             implementation,
             a100_block_threads,
@@ -234,6 +246,8 @@ class RNNBenchmarkModel(nn.Module):
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_K1_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_LDG_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT5_SPLIT0_KEEP_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_PARALLEL_UPDATE_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
@@ -262,8 +276,8 @@ class RNNBenchmarkModel(nn.Module):
                 raise ValueError(f"{implementation} only supports GRU.")
             if hidden_size != 256:
                 raise ValueError(f"{implementation} only supports hidden_size=256.")
-            if num_layers != 1:
-                raise ValueError(f"{implementation} only supports num_layers=1.")
+            if not 1 <= num_layers <= 4:
+                raise ValueError(f"{implementation} only supports 1 <= num_layers <= 4.")
             self.rnn = A100GRUH256(
                 input_size=input_dim,
                 hidden_size=hidden_size,
@@ -356,6 +370,8 @@ class RNNBenchmarkModel(nn.Module):
                     implementation
                     in {
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_K1_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_LDG_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_PARALLEL_UPDATE_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_PREV_CACHE_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
@@ -436,6 +452,7 @@ class RNNBenchmarkModel(nn.Module):
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_PACK_PREV_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT5_SPLIT0_KEEP_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT12_SPLIT0_KEEP_IMPLEMENTATION,
@@ -444,6 +461,10 @@ class RNNBenchmarkModel(nn.Module):
                         _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_OWN_SHMEM_IMPLEMENTATION,
                         _A100_HTILE4_COMPACT_HOIST_ROW4_SPLIT8_IMPLEMENTATION,
                     }
+                ),
+                use_gate_cache_htile4_compact_hoist_row4_k1_forward_kernel=(
+                    implementation
+                    == _A100_HTILE4_COMPACT_HOIST_ROW4_K1_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION
                 ),
                 use_gate_cache_htile4_compact_hoist_row4_ldg_forward_kernel=(
                     implementation
@@ -459,7 +480,11 @@ class RNNBenchmarkModel(nn.Module):
                 ),
                 use_pack_hidden_prev_time_major_kernel=(
                     implementation
-                    == _A100_HTILE4_COMPACT_HOIST_ROW4_PACK_PREV_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION
+                    in {
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION,
+                        _A100_HTILE4_COMPACT_HOIST_ROW4_PACK_PREV_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+                    }
                 ),
                 use_gate_cache_htile4_compact_hoist_row4_hidden_shmem_forward_kernel=(
                     implementation
@@ -493,6 +518,8 @@ class RNNBenchmarkModel(nn.Module):
                 out, hidden = self.rnn(chunk, hidden)
                 outputs.append(out)
             out = torch.cat(outputs, dim=1)
+        elif self.use_a100_output_only:
+            out = self.rnn.forward_output_only(x)
         else:
             out, _ = self.rnn(x)
         return self.head(out).squeeze(-1)
@@ -919,6 +946,8 @@ def parse_args() -> argparse.Namespace:
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT0_KEEP_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_K1_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
+            _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_OUTPUT_ONLY_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_LDG_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_WEIGHT_SHMEM_SPLIT5_SPLIT0_KEEP_IMPLEMENTATION,
             _A100_HTILE4_COMPACT_HOIST_ROW4_PARALLEL_UPDATE_WEIGHT_SHMEM_SPLIT6_SPLIT0_KEEP_IMPLEMENTATION,
@@ -945,7 +974,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=8000)
-    parser.add_argument("--input-dim", type=int, default=9)
+    parser.add_argument("--input-dim", type=int, default=16)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument(
         "--a100-block-threads",

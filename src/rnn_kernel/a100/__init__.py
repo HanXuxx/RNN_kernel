@@ -4,6 +4,8 @@ _AUTOGRAD_EXPORTS = {
     "A100GRUH256",
     "a100_gru_h256",
     "copy_from_torch_gru",
+    "from_torch_gru",
+    "is_supported_gru",
 }
 
 _FORWARD_EXPORTS = {
@@ -17,6 +19,16 @@ _FORWARD_EXPORTS = {
     "a100_gru_forward_from_gates_cooperative_h256_qwarp_shmem",
     "a100_gru_forward_from_gates_cooperative_h256_shmem",
     "a100_gru_forward_from_gates_cooperative_h256_shmem_gate_cache",
+    "a100_gru_forward_from_gates_cooperative_h256_htile8_compact_hoist_k1_no_cache",
+    "a100_gru_forward_from_gates_cooperative_h256_htile8_compact_hoist_k1_shmem_gate_cache",
+    "a100_gru_h256_stacked_backward_naive",
+    "a100_gru_h256_stacked_backward_split4",
+    "a100_gru_h256_stacked_backward_split4_group8",
+    "a100_gru_h256_stacked_backward_split4_shmem",
+    "a100_gru_h256_stacked_backward_split6_weight_shmem",
+    "a100_gru_h256_stacked_backward_split8",
+    "a100_gru_h256_stacked_row4_k1_train_forward",
+    "a100_gru_h256_stacked_row4_train_forward",
     "a100_gru_forward_from_gates_fused",
     "a100_gru_forward_from_gates_fused_pingpong",
     "a100_gru_forward_from_gates_fused_specialized",

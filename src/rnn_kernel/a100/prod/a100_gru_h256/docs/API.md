@@ -5,27 +5,28 @@
 ```python
 from a100_gru_h256 import A100GRUH256
 
-gru = A100GRUH256(input_size=5).cuda()
+gru = A100GRUH256(input_size=16, num_layers=2).cuda()
 output, h_n = gru(x, hx=None)
 ```
 
 参数：
 
-- `input_size`：输入维度。
+- `input_size`：输入维度，必须在 `1..16`。
 - `hidden_size`：必须为 `256`。
-- `num_layers`：必须为 `1`。
+- `num_layers`：必须为 `1`、`2`、`3` 或 `4`。
 - `batch_first`：必须为 `True`。
 - `bias`：必须为 `True`。
+- `dropout`：必须为 `0.0`。
 
 输入：
 
 - `x`：`[batch, seq, input_size]`，CUDA fp32 tensor。
-- `hx`：可选，`[1, batch, 256]`，CUDA fp32 tensor。
+- `hx`：可选，`[num_layers, batch, 256]`，CUDA fp32 tensor。
 
 输出：
 
 - `output`：`[batch, seq, 256]`
-- `h_n`：`[1, batch, 256]`
+- `h_n`：`[num_layers, batch, 256]`
 
 训练时普通 `forward()` 会使用带 `gate_cache` 的路径，以支持 backward。处于
 `torch.no_grad()` 或 `torch.inference_mode()` 时，普通 `forward()` 会自动切到
@@ -48,8 +49,8 @@ from a100_gru_h256 import from_torch_gru
 fast_gru = from_torch_gru(torch_gru)
 ```
 
-该函数会检查 `torch_gru` 是否满足支持范围，并复制 `weight_ih_l0`、`weight_hh_l0`、
-`bias_ih_l0`、`bias_hh_l0`。
+该函数会检查 `torch_gru` 是否满足支持范围，并复制每一层的 `weight_ih_l*`、
+`weight_hh_l*`、`bias_ih_l*`、`bias_hh_l*`。
 
 ## `is_supported_gru`
 

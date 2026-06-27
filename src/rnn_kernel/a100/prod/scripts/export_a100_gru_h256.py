@@ -32,7 +32,13 @@ def _copy_package(output_root: Path) -> None:
     if not (SOURCE_PACKAGE / "kernels" / "a100_gru_h256_sm80.cubin").is_file():
         raise FileNotFoundError("missing prebuilt sm80 cubin in source package")
 
-    for stale_path in (output_root / "pyproject.toml", output_root / "MANIFEST.in", output_root / "dist"):
+    stale_paths = [
+        output_root / "pyproject.toml",
+        output_root / "MANIFEST.in",
+        output_root / "dist",
+        output_root / "a100_gru_h256.tar.gz",
+    ]
+    for stale_path in stale_paths:
         _remove_path(stale_path)
 
     package_target = output_root / "a100_gru_h256"

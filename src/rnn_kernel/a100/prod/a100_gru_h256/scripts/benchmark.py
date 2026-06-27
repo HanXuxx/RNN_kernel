@@ -16,7 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=8000)
-    parser.add_argument("--input-size", type=int, default=5)
+    parser.add_argument("--input-size", type=int, default=16)
+    parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--timed-steps", type=int, default=10)
     parser.add_argument("--include-torch", action="store_true")
@@ -87,13 +88,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
 
-    torch_gru = torch.nn.GRU(args.input_size, 256, num_layers=1, batch_first=True).to(device)
+    torch_gru = torch.nn.GRU(args.input_size, 256, num_layers=args.num_layers, batch_first=True).to(device)
     fast_gru = from_torch_gru(torch_gru)
     x = torch.randn(args.batch_size, args.seq_len, args.input_size, device=device)
     target = torch.randn(args.batch_size, args.seq_len, device=device)
 
     print(f"gpu={torch.cuda.get_device_name()}")
-    print(f"batch_size={args.batch_size}, seq_len={args.seq_len}, input_size={args.input_size}")
+    print(
+        f"batch_size={args.batch_size}, seq_len={args.seq_len}, "
+        f"input_size={args.input_size}, num_layers={args.num_layers}"
+    )
     _benchmark(torch, "A100GRUH256", fast_gru, x, target, args.warmup_steps, args.timed_steps)
     if args.include_torch:
         _benchmark(torch, "torch.nn.GRU", torch_gru, x, target, args.warmup_steps, args.timed_steps)

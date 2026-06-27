@@ -16,7 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=5)
-    parser.add_argument("--input-size", type=int, default=5)
+    parser.add_argument("--input-size", type=int, default=16)
+    parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=2130)
     return parser.parse_args()
 
@@ -39,14 +40,14 @@ def main() -> None:
     torch_gru = torch.nn.GRU(
         input_size=args.input_size,
         hidden_size=hidden_size,
-        num_layers=1,
+        num_layers=args.num_layers,
         batch_first=True,
     ).to(device)
     fast_gru = from_torch_gru(torch_gru)
 
     x_torch = torch.randn(args.batch_size, args.seq_len, args.input_size, device=device, requires_grad=True)
     x_fast = x_torch.detach().clone().requires_grad_(True)
-    h0_torch = torch.randn(1, args.batch_size, hidden_size, device=device, requires_grad=True)
+    h0_torch = torch.randn(args.num_layers, args.batch_size, hidden_size, device=device, requires_grad=True)
     h0_fast = h0_torch.detach().clone().requires_grad_(True)
 
     torch_out, torch_h = torch_gru(x_torch, h0_torch)

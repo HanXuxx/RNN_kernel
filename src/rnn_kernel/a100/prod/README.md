@@ -16,21 +16,26 @@ implementation string 或大量 kernel 开关。prod 运行时不 import `rnn_ke
 
 当前固定组合：
 
-- forward：`htile4 compact hoist row4`
-- forward-only：`htile4 compact hoist row4 no-cache`
-- backward：`split6 persistent-state gate-cache tiled weight-shmem split0-keep`
+- forward：逐层 `htile4 compact hoist row4 K1 gate-cache`
+- forward-only：逐层 `htile4 compact hoist row4 K1 no-cache`
+- backward：逐层 `split6 persistent-state gate-cache tiled weight-shmem split0-keep unroll8`
 - 布局准备：`hidden-prev pack`
 - block threads：`256`
+
+该 prod 包同步的是当前最优非 fused 路径。真正 fused 多层 kernel 仍保留在
+`src/rnn_kernel/a100` 实验区，不作为本次产品默认路径。
 
 支持范围：
 
 - A100/SM80
 - `torch.float32`
+- `input_size=1..16`
 - `hidden_size=256`
-- `num_layers=1`
+- `num_layers=1..4`
 - 单向 GRU
 - `batch_first=True`
 - `bias=True`
+- `dropout=0.0`
 
 示例：
 
@@ -38,10 +43,10 @@ implementation string 或大量 kernel 开关。prod 运行时不 import `rnn_ke
 import torch
 from rnn_kernel.a100.prod import A100GRU, from_torch_gru
 
-gru = torch.nn.GRU(5, 256, num_layers=1, batch_first=True).cuda()
+gru = torch.nn.GRU(16, 256, num_layers=2, batch_first=True).cuda()
 fast_gru = from_torch_gru(gru)
 
-x = torch.randn(16, 8000, 5, device="cuda")
+x = torch.randn(16, 8000, 16, device="cuda")
 output, h_n = fast_gru(x)
 
 with torch.no_grad():
